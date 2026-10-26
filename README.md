@@ -57,11 +57,6 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **Важно:** Если при установке возникнет ошибка, связанная с `bcrypt` и `passlib`, убедитесь, что в `requirements.txt` указана версия `bcrypt==4.0.1`. Если нет — установите её вручную:
-> ```bash
-> pip install "bcrypt==4.0.1"
-> ```
-
 ### Шаг 4. Настройте токен бота
 
 В корне проекта создайте файл **`token.env`** и добавьте в него строку:
