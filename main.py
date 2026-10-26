@@ -197,6 +197,13 @@ async def cmd_profile(event: MessageCreated):
     else:
         await event.message.answer("Сначала войдите: /start → Войти.")
 
+# ======================= ОТМЕНА =======================
+@dp.message_created(Command("cancel"))
+async def cmd_cancel(event: MessageCreated):
+    user_id = str(event.from_user.user_id)
+    user_states.pop(user_id, None)
+    await event.message.answer("Действие отменено. Используйте /start для начала.")
+
 # ======================= ОБРАБОТКА ТЕКСТА (ДИАЛОГ) =======================
 @dp.message_created()
 async def handle_text(event: MessageCreated):
@@ -254,14 +261,6 @@ async def handle_text(event: MessageCreated):
                 await event.message.answer("❌ Неверное ФИО или пароль.")
             user_states.pop(user_id, None)
             return
-
-
-# ======================= ОТМЕНА =======================
-@dp.message_created(Command("cancel"))
-async def cmd_cancel(event: MessageCreated):
-    user_id = str(event.from_user.user_id)
-    user_states.pop(user_id, None)
-    await event.message.answer("Действие отменено. Используйте /start для начала.")
 
 # ======================= ЗАПУСК =======================
 async def main():
