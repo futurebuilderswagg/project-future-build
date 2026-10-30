@@ -617,7 +617,6 @@ async def set_bot_commands():
     commands = [
         BotCommand(name="start", description="Запустить бота"),
         BotCommand(name="register", description="Регистрация"),
-        BotCommand(name="help", description="Показать справку"),
         BotCommand(name="profile", description="Мой профиль и меню"),
         BotCommand(name="create_class", description="Создать класс (учитель)"),
         BotCommand(name="invite", description="Пригласить ученика (учитель)"),
