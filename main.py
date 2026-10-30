@@ -18,7 +18,7 @@ from maxapi.types import CallbackButton, BotCommand, MessageCreated, Command, Me
 # ======================= НАСТРОЙКИ =======================
 logging.basicConfig(level=logging.INFO)
 DB_PATH = "bot.db"
-CACHE_TTL = 600
+CACHE_TTL = 86400
 TEST_DURATION_MINUTES = 20
 RESULTS_PAGE_SIZE = 10
 
