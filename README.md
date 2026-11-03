@@ -208,17 +208,12 @@
 | --- | --- |
 | `main.py` | Обработчики MAX, регистрация, классы, приглашения, тесты, отчёты и SQLite |
 | `requirements.txt` | Зависимости для запуска бота |
-| `requirements-dev.txt` | Зависимости бота и инструменты автоматических проверок |
 | `README.md` | Возможности, установка и эксплуатация |
 | `Dockerfile` | Сборка образа на Python 3.12 |
 | `.dockerignore` | Ограничивает контекст сборки исходником и необходимыми конфигурациями |
 | `.gitignore` | Исключает токены, базы, резервные копии и локальные окружения |
 | `token.env.example` | Шаблон настройки без действующего токена |
-| `test_template.xlsx` | Пример Excel с пятью колонками и двумя вопросами сложности 1 и 2 |
-| `pytest.ini` | Настройки запуска тестов |
-| `tests/` | Регрессионные проверки приглашений, тестирования и отчётов |
 | `token.env` | Локальный файл с действующим токеном; создаётся пользователем |
-| `bot.db` | Рабочая SQLite-база; создаётся при запуске либо переносится из прежней установки |
 
 ## Требования и зависимости
 
@@ -228,21 +223,7 @@
 - Доступ к MAX Bot API по сети.
 - Для контейнерного запуска — Docker Engine либо Docker Desktop с Linux-контейнерами.
 
-[requirements.txt](requirements.txt) фиксирует прямые зависимости:
-
-```text
-maxapi==1.2.3
-passlib==1.7.4
-bcrypt==4.0.1
-openpyxl==3.1.5
-defusedxml==0.7.1
-```
-
-`maxapi` обеспечивает работу с MAX Bot API, `passlib` — проверку и хеширование паролей, `bcrypt` — используемую реализацию хеширования. Сочетание версий проверено на реальной регистрации и входе. `bcrypt` указан явно, поскольку одного `passlib` для выбранной схемы недостаточно; см. [документацию Passlib](https://passlib.readthedocs.io/en/stable/lib/passlib.hash.bcrypt.html).
-
-`openpyxl` читает загруженные таблицы `.xlsx`, а `defusedxml` защищает разбор XML, из которого состоит Excel-файл. Рекомендация по этой зависимости приведена в [документации openpyxl](https://pypi.org/project/openpyxl/3.1.5/). После обновления проекта повторите установку из `requirements.txt`.
-
-Зависимости самого `maxapi`, включая `aiohttp` и `pydantic`, устанавливает `pip`. Отдельно устанавливать `sqlite3`, `asyncio`, `decimal` и другие модули стандартной библиотеки не нужно. `python-dotenv` не используется: у проекта собственная функция чтения `token.env`. Это фиксация прямых зависимостей, а не полный lock-файл всех транзитивных пакетов.
+Все необходимые библиотеки перечислены в [requirements.txt](requirements.txt). Установите их одной командой `python -m pip install -r requirements.txt`, как показано в разделе ниже.
 
 ## Локальная установка и запуск
 
@@ -311,19 +292,29 @@ Windows PowerShell:
 
 ## Запуск через Docker
 
-Для обычного запуска этим способом Python на хосте не требуется. Подготовьте `token.env` в корне проекта по инструкции выше. Подготовку копии прежней базы для переноса можно выполнить на машине прежней установки с Python.
-
-**Если нужно сохранить прежних пользователей, классы и результаты, сначала выполните [перенос существующей базы](#перенос-существующей-базы-в-docker).** Без переноса новый том получит новую базу.
+Для сборки используйте приложенные к проекту [Dockerfile](Dockerfile) и [.dockerignore](.dockerignore). Установите и запустите Docker Engine либо Docker Desktop с Linux-контейнерами. Откройте терминал в корне проекта, где находятся `Dockerfile`, `.dockerignore`, `requirements.txt` и `main.py`.
 
 ### Сборка образа
 
-Выполните из каталога с `Dockerfile`:
+Выполните команду из корня проекта; она подходит для Linux, macOS и Windows PowerShell:
 
 ```bash
-docker --version
-docker build -t max-school-bot:local .
+docker build -f Dockerfile -t max-school-bot:local .
+```
+
+Параметр `-f Dockerfile` выбирает файл сборки из проекта, а точка в конце задаёт текущий каталог как контекст сборки. Docker автоматически применяет расположенный здесь `.dockerignore`: в контекст попадают только файлы сборки, `requirements.txt` и `main.py`.
+
+Приложенный `Dockerfile` устанавливает зависимости из `requirements.txt` и задаёт команду запуска бота. Для сборки и обычного запуска контейнера Python и библиотеки на компьютере отдельно устанавливать не требуется.
+
+### Подготовка к запуску
+
+Создайте `token.env` в корне проекта по разделу [«Настройка токена»](#настройка-токена) и укажите токен своего бота. Токен подключается к контейнеру при запуске. Для хранения базы создайте постоянный том:
+
+```bash
 docker volume create max-school-bot-data
 ```
+
+**Если нужно сохранить прежних пользователей, классы, результаты и баллы, перед первым запуском выполните [перенос существующей базы](#перенос-существующей-базы-в-docker).** Без переноса новый том получит новую базу. Копию прежней базы можно подготовить на машине прежней установки с Python.
 
 ### Linux и macOS
 
@@ -397,7 +388,7 @@ docker restart max-school-bot
 Соберите новый образ, затем остановите и удалите прежний контейнер:
 
 ```bash
-docker build -t max-school-bot:local .
+docker build -f Dockerfile -t max-school-bot:local .
 docker stop max-school-bot
 docker rm max-school-bot
 ```
@@ -422,7 +413,7 @@ python -c "import sqlite3; from pathlib import Path; p=Path('bot-transfer.db'); 
 3. Соберите образ и импортируйте копию. Следующий блок — для Linux/macOS. Он откажется заменять уже существующую базу в томе:
 
 ```bash
-docker build -t max-school-bot:local .
+docker build -f Dockerfile -t max-school-bot:local .
 docker volume create max-school-bot-data
 docker run --rm --user 0 \
   --mount type=volume,source=max-school-bot-data,target=/app/data \
@@ -433,7 +424,7 @@ docker run --rm --user 0 \
 Для Windows PowerShell используйте эквивалентный блок:
 
 ```powershell
-docker build -t max-school-bot:local .
+docker build -f Dockerfile -t max-school-bot:local .
 docker volume create max-school-bot-data
 $dbBackupPath = (Resolve-Path .\bot-transfer.db).Path
 docker run --rm --user 0 --mount type=volume,source=max-school-bot-data,target=/app/data --mount "type=bind,source=${dbBackupPath},target=/restore/bot-transfer.db,readonly" max-school-bot:local python -c "import os, shutil; from pathlib import Path; s=Path('/restore/bot-transfer.db'); d=Path('/app/data/bot.db'); assert s.is_file(), 'Source database is missing'; assert not d.exists(), 'Target database already exists'; shutil.copyfile(s, d); os.chown(d, 10001, 10001)"
@@ -549,8 +540,5 @@ docker cp max-school-bot:/app/data/bot-backup.db ./bot-backup.db
 ## Документация используемых инструментов
 
 - [MAX Bot API](https://dev.max.ru/docs-api/)
-- [maxapi 1.2.3](https://pypi.org/project/maxapi/1.2.3/)
 - [Виртуальные окружения Python](https://docs.python.org/3.12/library/venv.html)
-- [Passlib и bcrypt](https://passlib.readthedocs.io/en/stable/lib/passlib.hash.bcrypt.html)
-- [openpyxl](https://pypi.org/project/openpyxl/3.1.5/)
 - [Docker volumes](https://docs.docker.com/engine/storage/volumes/)
