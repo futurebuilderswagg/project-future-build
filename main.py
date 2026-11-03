@@ -5,9 +5,18 @@ import sqlite3
 import time
 import re
 import json
+import ipaddress
+import socket
+from io import BytesIO
+from pathlib import PurePath
+from urllib.parse import urlsplit, urljoin
+from zipfile import ZipFile
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from html import escape
 
+import aiohttp
+from openpyxl import load_workbook
 from passlib.context import CryptContext
 
 from maxapi import Bot, Dispatcher, F
@@ -19,8 +28,14 @@ from maxapi.types import CallbackButton, BotCommand, MessageCreated, Command, Me
 logging.basicConfig(level=logging.INFO)
 DB_PATH = "bot.db"
 CACHE_TTL = 86400
+DIFFICULTY_NAMES = {1: "Легкий", 2: "Средний", 3: "Сложный"}
 TEST_DURATION_MINUTES = 20
 RESULTS_PAGE_SIZE = 10
+MAX_TEST_TITLE_LENGTH = 120
+MAX_IMPORTED_QUESTIONS = 200
+MAX_EXCEL_FILE_BYTES = 5 * 1024 * 1024
+MAX_EXCEL_UNPACKED_BYTES = 25 * 1024 * 1024
+MAX_EXCEL_ROWS = 2000
 
 # ======================= ЧТЕНИЕ .env =======================
 def load_env(path="token.env"):
@@ -55,6 +70,7 @@ def init_db():
                 password_hash TEXT NOT NULL,
                 role TEXT DEFAULT 'student',
                 max_user_id TEXT,
+                points INTEGER NOT NULL DEFAULT 0 CHECK(typeof(points) = 'integer' AND points >= 0),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -88,7 +104,7 @@ def init_db():
                 options TEXT NOT NULL,
                 correct_answer TEXT NOT NULL,
                 explanation TEXT,
-                difficulty TEXT
+                difficulty INTEGER NOT NULL DEFAULT 1 CHECK(difficulty IN (1, 2, 3))
             )
         """)
         conn.execute("""
@@ -120,6 +136,53 @@ def init_db():
         if "max_user_id" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN max_user_id TEXT")
             logging.info("Добавлена колонка max_user_id в таблицу users")
+        if "points" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN points INTEGER NOT NULL DEFAULT 0 CHECK(typeof(points) = 'integer' AND points >= 0)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_message_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (teacher_id) REFERENCES users(id),
+                UNIQUE(teacher_id, source_message_id)
+            )
+        """)
+        # У прежних вопросов и выдач template_id остаётся NULL.
+        for table, additions in (
+            ("questions", {"template_id": "INTEGER REFERENCES test_templates(id)", "question_number": "INTEGER",
+                           "difficulty": "INTEGER NOT NULL DEFAULT 1 CHECK(difficulty IN (1, 2, 3))"}),
+            ("tests", {"template_id": "INTEGER REFERENCES test_templates(id)"}),
+        ):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, declaration in additions.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_template_question_number ON questions(template_id, question_number)")
+        # Не пересоздаём старую таблицу: сохраняем ID, связи и пользовательские индексы.
+        # SQLite сохраняет цифровые коды как TEXT в прежней колонке; при чтении берём int.
+        legacy_levels = {"1": 1, "базовая": 1, "легкий": 1, "лёгкий": 1, "легкая": 1, "лёгкая": 1,
+                         "2": 2, "средняя": 2, "средний": 2,
+                         "3": 3, "сложная": 3, "сложный": 3}
+        for row in conn.execute("SELECT id, difficulty FROM questions"):
+            value = str(row["difficulty"] or "").strip().casefold()
+            level = legacy_levels.get(value, 1)
+            if str(row["difficulty"]) != str(level):
+                conn.execute("UPDATE questions SET difficulty = ? WHERE id = ?", (level, row["id"]))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS student_answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_id INTEGER NOT NULL REFERENCES tests(id),
+                student_id INTEGER NOT NULL REFERENCES users(id),
+                question_id INTEGER NOT NULL REFERENCES questions(id),
+                answer TEXT NOT NULL CHECK(answer IN ('А', 'Б', 'В', 'Г', 'X')),
+                is_correct INTEGER NOT NULL CHECK(is_correct IN (0, 1)),
+                points INTEGER NOT NULL CHECK(points BETWEEN 0 AND 3),
+                answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(test_id, student_id, question_id)
+            )
+        """)
         conn.commit()
 
 # ======================= ЗАПОЛНЕНИЕ ВОПРОСОВ =======================
@@ -127,89 +190,89 @@ QUESTIONS_DATA = [
     # Механика (10)
     ("Механика", "Тело движется равномерно по окружности. Как направлено его ускорение?",
      "А — по касательной, Б — к центру, В — от центра, Г — ускорение = 0.", "Б",
-     "центростремительное ускорение направлено к центру.", "Базовая"),
+     "центростремительное ускорение направлено к центру.", 1),
     ("Механика", "На тело массой 2 кг действует сила 10 Н. Чему равно ускорение?",
-     "А — 0,2, Б — 5, В — 10, Г — 20 (м/с²).", "Б", "a = F/m = 10/2 = 5 м/с²", "Базовая"),
+     "А — 0,2, Б — 5, В — 10, Г — 20 (м/с²).", "Б", "a = F/m = 10/2 = 5 м/с²", 1),
     ("Механика", "Мяч бросили вверх со скоростью 20 м/с. Через сколько секунд он достигнет верхней точки (g ≈ 10)?",
-     "А — 1, Б — 2, В — 3, Г — 4 (с).", "Б", "t=v0/g=20/10=2 с", "Базовая"),
+     "А — 1, Б — 2, В — 3, Г — 4 (с).", "Б", "t=v0/g=20/10=2 с", 1),
     ("Механика", "Два тела одинаковой массы движутся со скоростями v и 2v. Во сколько раз импульс второго больше?",
-     "А — в 2, Б — в 3, В — в 4, Г — импульсы равны.", "А", "импульс p=mv, при удвоенной скорости импульс удваивается.", "Базовая"),
+     "А — в 2, Б — в 3, В — в 4, Г — импульсы равны.", "А", "импульс p=mv, при удвоенной скорости импульс удваивается.", 1),
     ("Механика", "Санки скатываются без трения. Как меняется полная механическая энергия?",
-     "А — растёт, Б — падает, В — не меняется, Г — сначала растёт, потом падает.", "В", "без трения энергия сохраняется.", "Базовая"),
+     "А — растёт, Б — падает, В — не меняется, Г — сначала растёт, потом падает.", "В", "без трения энергия сохраняется.", 1),
     ("Механика", "Автомобиль 1 т разгоняется до 20 м/с за 10 с. Средняя мощность двигателя?",
-     "А — 2, Б — 10, В — 20, Г — 40 (кВт).", "В", "A = mv²/2 = 200000 Дж, P = A/t = 20кВт", "Средняя"),
+     "А — 2, Б — 10, В — 20, Г — 40 (кВт).", "В", "A = mv²/2 = 200000 Дж, P = A/t = 20кВт", 2),
     ("Механика", "Брусок скользит с постоянной скоростью. Чему равна равнодействующая сил?",
      "А — больше нуля, Б — меньше нуля, В — равна нулю, Г — зависит от массы.", "В",
-     "постоянная скорость → ускорение = 0 → равнодействующая = 0.", "Базовая"),
+     "постоянная скорость → ускорение = 0 → равнодействующая = 0.", 1),
     ("Механика", "Расстояние между телами уменьшили в 2 раза. Как изменится сила тяготения?",
      "А — уменьшится в 2, Б — увеличится в 2, В — уменьшится в 4, Г — увеличится в 4 раза.", "Г",
-     "F = 1 / r², при уменьшении r в 2 раза сила растёт в 4 раза.", "Базовая"),
+     "F = 1 / r², при уменьшении r в 2 раза сила растёт в 4 раза.", 1),
     ("Механика", "Пружину жёсткостью 200 Н/м растянули на 5 см. Сила упругости?",
-     "А — 1, Б — 10, В — 40, Г — 100 (Н).", "Б", "F = kΔx = 200*0,05 = 10 Н.", "Базовая"),
+     "А — 1, Б — 10, В — 40, Г — 100 (Н).", "Б", "F = kΔx = 200*0,05 = 10 Н.", 1),
     ("Механика", "С какой высоты упало тело за 3 с без начальной скорости (g ≈ 10)?",
-     "А — 15, Б — 30, В — 45, Г — 90 (м).", "В", "h = gt² / 2 = 45 м.", "Базовая"),
+     "А — 15, Б — 30, В — 45, Г — 90 (м).", "В", "h = gt² / 2 = 45 м.", 1),
     # Термодинамика (10)
     ("Термодинамика", "Что характеризует температура с молекулярной точки зрения?",
      "А — потенциальную энергию, Б — среднюю кинетическую энергию, В — количество теплоты, Г — давление.", "Б",
-     "температура — мера средней кинетической энергии молекул.", "Базовая"),
+     "температура — мера средней кинетической энергии молекул.", 1),
     ("Термодинамика", "Процесс при постоянной температуре?",
      "А — изобарный, Б — изохорный, В — изотермический, Г — адиабатный.", "В",
-     "«изотермический» = постоянная температура.", "Базовая"),
+     "«изотермический» = постоянная температура.", 1),
     ("Термодинамика", "Газ получил 300 Дж теплоты и совершил работу 100 Дж. Как изменилась внутренняя энергия?",
      "А — на 200 Дж увеличилась, Б — на 400 Дж увеличилась, В — на 200 Дж уменьшилась, Г — на 400 Дж уменьшилась.", "А",
-     "ΔU = Q - A = 300 - 100 = 200 Дж.", "Средняя"),
+     "ΔU = Q - A = 300 - 100 = 200 Дж.", 2),
     ("Термодинамика", "Температура идеального газа увеличилась в 3 раза при постоянном объёме. Во сколько раз вырастет давление?",
      "А — в 1,5, Б — в 3, В — в 6, Г — в 9 раз.", "Б",
-     "изохорный процесс: p/T=const, давление прямо пропорционально температуре.", "Средняя"),
+     "изохорный процесс: p/T=const, давление прямо пропорционально температуре.", 2),
     ("Термодинамика", "Удельная теплоёмкость: на нагрев 2 кг на 10 °C ушло 8 кДж. Чему она равна?",
      "А — 200, Б — 400, В — 800, Г — 1600 (Дж/(кг·°C)).", "Б",
-     "c=Q/(mΔT)=8000/(2*10)=400 Дж/(кг·°C).", "Средняя"),
+     "c=Q/(mΔT)=8000/(2*10)=400 Дж/(кг·°C).", 2),
     ("Термодинамика", "При каком процессе нет теплообмена с окружающей средой?",
      "А — изотермическом, Б — изобарном, В — адиабатном, Г — изохорном.", "В",
-     "адиабатный процесс — без теплообмена.", "Базовая"),
+     "адиабатный процесс — без теплообмена.", 1),
     ("Термодинамика", "Как изменится средняя квадратичная скорость молекул, если температура увеличится в 4 раза?",
      "А — не изменится, Б — увеличится в 2 раза, В — увеличится в 4 раза, Г — уменьшится в 2 раза.", "Б",
-     "v ∼√T, при росте T в 4 раза скорость растёт в 2 раза.", "Средняя"),
+     "v ∼√T, при росте T в 4 раза скорость растёт в 2 раза.", 2),
     ("Термодинамика", "Что происходит с температурой жидкости при кипении?",
      "А — постоянно растёт, Б — постоянно падает, В — остаётся постоянной, Г — сначала растёт, потом падает.", "В",
-     "энергия идёт на парообразование, температура не меняется.", "Базовая"),
+     "энергия идёт на парообразование, температура не меняется.", 1),
     ("Термодинамика", "Сколько теплоты нужно, чтобы расплавить 1 кг льда при 0 °C",
-     "А — 33, Б — 330, В — 660, Г — 990 (кДж).", "Б", "Q=λm=330*1=330 кДж.", "Базовая"),
+     "А — 33, Б — 330, В — 660, Г — 990 (кДж).", "Б", "Q=λm=330*1=330 кДж.", 1),
     ("Термодинамика", "Что такое относительная влажность воздуха?",
      "А — отношение масс пара и воздуха, Б — отношение давлений пара и насыщенного пара, В — абсолютное количество пара в 1 м³, Г — температура конденсации.", "Б",
-     "относительная влажность — это отношение парциального давления к давлению насыщенного пара при той же температуре.", "Базовая"),
+     "относительная влажность — это отношение парциального давления к давлению насыщенного пара при той же температуре.", 1),
     # Электродинамика (10)
     ("Электродинамика", "Как взаимодействуют одноимённые заряды?",
      "А — притягиваются, Б — отталкиваются, В — не взаимодействуют, Г — взаимодействуют только в вакууме.", "Б",
-     "одноимённые заряды отталкиваются.", "Базовая"),
+     "одноимённые заряды отталкиваются.", 1),
     ("Электродинамика", "Ток 2 А. Какой заряд пройдёт через сечение за 5 с?",
-     "А — 2, Б — 5, В — 10, Г — 20 (Кл).", "В", "q=It=2⋅5=10 Кл.", "Базовая"),
+     "А — 2, Б — 5, В — 10, Г — 20 (Кл).", "В", "q=It=2⋅5=10 Кл.", 1),
     ("Электродинамика", "Сопротивление 10 Ом, напряжение 20 В. Какой ток?",
-     "А — 0,5, Б — 2, В — 10, Г — 200 (А).", "Б", "по закону Ома I=U/R=20/10=2 А.", "Базовая"),
+     "А — 0,5, Б — 2, В — 10, Г — 200 (А).", "Б", "по закону Ома I=U/R=20/10=2 А.", 1),
     ("Электродинамика", "Два резистора по 10 Ом соединены последовательно. Общее сопротивление?",
-     "А — 5, Б — 10, В — 20, Г — 40 (Ом).", "В", "Rобщ = R1 + R2 = 20 Ом.", "Базовая"),
+     "А — 5, Б — 10, В — 20, Г — 40 (Ом).", "В", "Rобщ = R1 + R2 = 20 Ом.", 1),
     ("Электродинамика", "Два одинаковых резистора по 10 Ом параллельно. Общее сопротивление?",
      "А — 5, Б — 10, В — 20, Г — 40 (Ом).", "А",
-     "для двух одинаковых параллельных: Rобщ = R/2 = 5 Ом.", "Базовая"),
+     "для двух одинаковых параллельных: Rобщ = R/2 = 5 Ом.", 1),
     ("Электродинамика", "Работа тока за 10 с: ток 3 А, напряжение 12 В?",
-     "А — 36, Б — 120, В — 360, Г — 1200 (Дж).", "В", "A = UIt = 12*3*10 = 360 Дж.", "Базовая"),
+     "А — 36, Б — 120, В — 360, Г — 1200 (Дж).", "В", "A = UIt = 12*3*10 = 360 Дж.", 1),
     ("Электродинамика", "Напряжение увеличили в 2 раза, сопротивление не меняли. Как изменится ток?",
      "А — уменьшится в 2 раза, Б — не изменится, В — увеличится в 2 раза, Г — увеличится в 4 раза.", "В",
-     "из закона Ома I=U/R, при увеличении U в 2 раза ток тоже растёт в 2 раза.", "Базовая"),
+     "из закона Ома I=U/R, при увеличении U в 2 раза ток тоже растёт в 2 раза.", 1),
     ("Электродинамика", "В комнате включили ещё одну лампочку (параллельно к тем, что уже горят). Что произойдёт с общим сопротивлением цепи?",
      "А — увеличится, Б — уменьшится, В — не изменится, Г — сначала увеличится, потом уменьшится.", "Б",
-     "при параллельном подключении общее сопротивление всегда уменьшается.", "Базовая"),
+     "при параллельном подключении общее сопротивление всегда уменьшается.", 1),
     ("Электродинамика", "Если разрезать провод пополам и соединить эти половинки параллельно, каким станет общее сопротивление по сравнению с исходным?",
      "А — таким же, Б — в 2 раза меньше, В — в 4 раза меньше, Г — в 2 раза больше.", "В",
-     "каждая половинка имеет сопротивление в 2 раза меньше исходного. При параллельном соединении двух одинаковых сопротивлений общее будет ещё в 2 раза меньше. Итого: в 4 раза меньше.", "Средняя"),
+     "каждая половинка имеет сопротивление в 2 раза меньше исходного. При параллельном соединении двух одинаковых сопротивлений общее будет ещё в 2 раза меньше. Итого: в 4 раза меньше.", 2),
     ("Электродинамика", "К источнику постоянного напряжения подключили резистор. Как изменится мощность, выделяемая на резисторе, если его сопротивление уменьшить в 2 раза?",
      "А — уменьшится в 2 раза, Б — уменьшится в 4 раза, В — увеличится в 2 раза, Г — увеличится в 4 раза.", "В",
-     "мощность P=U²/R. Напряжение постоянно, R уменьшили в 2 раза → мощность увеличилась в 2 раза.", "Средняя"),
+     "мощность P=U²/R. Напряжение постоянно, R уменьшили в 2 раза → мощность увеличилась в 2 раза.", 2),
 ]
 
 def seed_questions():
     with get_connection() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM questions WHERE template_id IS NULL").fetchone()[0]
         if count == 0:
             for q in QUESTIONS_DATA:
                 conn.execute(
@@ -296,13 +359,16 @@ def get_teacher_classes(teacher_id: int) -> list[dict]:
 def get_class_students(class_id: int) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT u.id, u.full_name, u.max_user_id
+            SELECT u.id, u.full_name, u.max_user_id, u.points
             FROM class_members cm
             JOIN users u ON cm.student_id = u.id
             WHERE cm.class_id = ? AND cm.status = 'accepted'
             ORDER BY u.full_name
         """, (class_id,)).fetchall()
-    return [dict(r) for r in rows]
+    # SQLite NOCASE не сортирует кириллицу без учёта регистра.
+    return sorted((dict(r) for r in rows), key=lambda student: (
+        student["full_name"].casefold().replace("ё", "е"), student["id"]
+    ))
 
 def get_class_by_id(class_id: int) -> dict | None:
     with get_connection() as conn:
@@ -358,24 +424,94 @@ def get_pending_invitation(student_id: int) -> dict | None:
 # ---------- Вопросы и тесты ----------
 def get_topics() -> list[str]:
     with get_connection() as conn:
-        rows = conn.execute("SELECT DISTINCT topic FROM questions").fetchall()
+        rows = conn.execute("SELECT DISTINCT topic FROM questions WHERE template_id IS NULL ORDER BY topic").fetchall()
     return [r["topic"] for r in rows]
 
 def get_questions_by_topic(topic: str) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, question_text, options, correct_answer, explanation, difficulty FROM questions WHERE topic = ? ORDER BY id",
+            "SELECT id, question_text, options, correct_answer, explanation, difficulty FROM questions WHERE topic = ? AND template_id IS NULL ORDER BY id",
             (topic,)
         ).fetchall()
     return [dict(r) for r in rows]
 
-def create_test(teacher_id: int, topic: str, class_id: int | None) -> int:
+def get_test_template(template_id: int, teacher_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT t.*, (SELECT COUNT(*) FROM questions q WHERE q.template_id = t.id) AS question_count
+            FROM test_templates t WHERE t.id = ? AND t.teacher_id = ?
+        """, (template_id, teacher_id)).fetchone()
+    return dict(row) if row else None
+
+
+def get_teacher_test_templates(teacher_id: int) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT t.*, (SELECT COUNT(*) FROM questions q WHERE q.template_id = t.id) AS question_count
+            FROM test_templates t WHERE t.teacher_id = ? ORDER BY t.id DESC
+        """, (teacher_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_template_questions(template_id: int, teacher_id: int) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT q.* FROM questions q JOIN test_templates t ON t.id = q.template_id
+            WHERE t.id = ? AND t.teacher_id = ? ORDER BY q.question_number, q.id
+        """, (template_id, teacher_id)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_test_template(teacher_id: int, title: str, questions: list[dict], source_message_id=None) -> int:
+    title = " ".join(title.split())
+    if not title or len(title) > MAX_TEST_TITLE_LENGTH:
+        raise ValueError(f"Название должно содержать от 1 до {MAX_TEST_TITLE_LENGTH} символов.")
+    if not 1 <= len(questions) <= MAX_IMPORTED_QUESTIONS:
+        raise ValueError(f"В тесте должно быть от 1 до {MAX_IMPORTED_QUESTIONS} вопросов.")
+    numbers = set()
+    for question in questions:
+        number = parse_excel_question_number(question.get("question_number"))
+        if number in numbers:
+            raise ValueError(f"Повторяется номер вопроса {number}.")
+        numbers.add(number)
+        validate_imported_question(question, title)
+    with get_connection() as conn:
+        teacher = conn.execute("SELECT role FROM users WHERE id = ?", (teacher_id,)).fetchone()
+        if not teacher or teacher["role"] != "teacher":
+            raise ValueError("Создавать тесты может только учитель.")
+        if source_message_id:
+            old = conn.execute("SELECT id FROM test_templates WHERE teacher_id = ? AND source_message_id = ?",
+                               (teacher_id, str(source_message_id))).fetchone()
+            if old:
+                return old["id"]
+        cur = conn.execute("INSERT INTO test_templates (teacher_id, title, source_message_id) VALUES (?, ?, ?)",
+                           (teacher_id, title, str(source_message_id) if source_message_id else None))
+        template_id = cur.lastrowid
+        conn.executemany("""
+            INSERT INTO questions (topic, question_text, options, correct_answer, explanation, difficulty, template_id, question_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (title, q["question_text"].strip(), q["options"], q["correct_answer"].strip().upper(),
+             q.get("explanation") or "", parse_excel_difficulty(q.get("difficulty")), template_id,
+             parse_excel_question_number(q["question_number"]))
+            for q in questions
+        ])
+        # Контекст соединения фиксирует весь тест или откатывает все его строки.
+    return template_id
+
+
+def create_test(teacher_id: int, topic: str, class_id: int | None, *, template_id: int | None = None) -> int:
+    if template_id is not None:
+        template = get_test_template(template_id, teacher_id)
+        if not template:
+            raise ValueError("Созданный тест не найден или принадлежит другому учителю.")
+        topic = template["title"]
     now = datetime.now()
     ends_at = now + timedelta(minutes=TEST_DURATION_MINUTES)
     with get_connection() as conn:
         cur = conn.execute(
-            "INSERT INTO tests (teacher_id, topic, class_id, ends_at) VALUES (?, ?, ?, ?)",
-            (teacher_id, topic, class_id, ends_at.strftime("%Y-%m-%d %H:%M:%S"))
+            "INSERT INTO tests (teacher_id, topic, class_id, ends_at, template_id) VALUES (?, ?, ?, ?, ?)",
+            (teacher_id, topic, class_id, ends_at.strftime("%Y-%m-%d %H:%M:%S"), template_id)
         )
         conn.commit()
         return cur.lastrowid
@@ -432,6 +568,88 @@ def get_result(test_id: int, student_id: int) -> dict | None:
             (test_id, student_id)
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_student_points(student_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT points FROM users WHERE id = ?", (student_id,)).fetchone()
+    return int(row["points"]) if row else 0
+
+
+def get_student_test_answers(test_id: int, student_id: int) -> dict[int, dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM student_answers WHERE test_id = ? AND student_id = ?",
+                            (test_id, student_id)).fetchall()
+    return {row["question_id"]: dict(row) for row in rows}
+
+
+def record_student_answer(test_id: int, student_id: int, question_id: int, answer: str) -> dict:
+    """Первый ответ и баллы сохраняются одной транзакцией, независимо от сессии MAX."""
+    if answer not in ("А", "Б", "В", "Г", "X"):
+        raise ValueError("Недопустимый вариант ответа.")
+    with get_connection() as conn:
+        # Сериализуем также разные процессы и разные MAX-сессии одного ученика.
+        conn.execute("BEGIN IMMEDIATE")
+        saved = conn.execute("SELECT * FROM student_answers WHERE test_id = ? AND student_id = ? AND question_id = ?",
+                             (test_id, student_id, question_id)).fetchone()
+        if saved:
+            return {**dict(saved), "newly_recorded": False}
+        test = conn.execute("SELECT * FROM tests WHERE id = ?", (test_id,)).fetchone()
+        student = conn.execute("SELECT role FROM users WHERE id = ?", (student_id,)).fetchone()
+        if not test or not student or student["role"] != "student":
+            raise ValueError("Тест или ученик не найден.")
+        if not is_test_active(dict(test)):
+            raise ValueError("Срок прохождения теста истёк.")
+        member = conn.execute("""
+            SELECT 1 FROM class_members cm JOIN classes c ON c.id = cm.class_id
+            WHERE cm.student_id = ? AND cm.status = 'accepted' AND c.teacher_id = ?
+              AND (? IS NULL OR c.id = ?) LIMIT 1
+        """, (student_id, test["teacher_id"], test["class_id"], test["class_id"])).fetchone()
+        if not member:
+            raise ValueError("Этот тест не назначен вашему классу.")
+        if conn.execute("SELECT 1 FROM test_results WHERE test_id = ? AND student_id = ?",
+                        (test_id, student_id)).fetchone():
+            raise ValueError("Этот тест уже завершён.")
+        question = conn.execute("""
+            SELECT * FROM questions WHERE id = ? AND
+                ((? IS NOT NULL AND template_id = ?) OR
+                 (? IS NULL AND template_id IS NULL AND topic = ?))
+        """, (question_id, test["template_id"], test["template_id"], test["template_id"], test["topic"])).fetchone()
+        if not question:
+            raise ValueError("Вопрос не принадлежит этому тесту.")
+        difficulty = parse_excel_difficulty(question["difficulty"])
+        is_correct = int(answer == question["correct_answer"].strip().upper())
+        points = difficulty if is_correct else 0
+        cur = conn.execute("""
+            INSERT INTO student_answers (test_id, student_id, question_id, answer, is_correct, points)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (test_id, student_id, question_id, answer, is_correct, points))
+        if points:
+            conn.execute("UPDATE users SET points = points + ? WHERE id = ?", (points, student_id))
+        saved = conn.execute("SELECT * FROM student_answers WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return {**dict(saved), "newly_recorded": True}
+
+
+def sync_test_progress(state: dict):
+    answers = get_student_test_answers(state["test_id"], state["student_id"])
+    questions = state["questions"]
+    state["score"] = sum(answers[q["id"]]["is_correct"] for q in questions if q["id"] in answers)
+    state["earned_points"] = sum(answers[q["id"]]["points"] for q in questions if q["id"] in answers)
+    current = next((i for i, q in enumerate(questions) if q["id"] not in answers), len(questions))
+    if current != state["current"]:
+        state["question_sent"] = False
+    state["current"] = current
+
+
+def restore_test_state(test: dict, student_id: int) -> dict:
+    questions = prepare_test_questions(test["topic"], template_id=test.get("template_id"), teacher_id=test["teacher_id"])
+    if not questions:
+        raise ValueError("В тесте пока нет вопросов.")
+    state = {"test_id": test["id"], "student_id": student_id, "topic": test["topic"],
+             "ends_at": test["ends_at"], "questions": questions, "current": 0,
+             "score": 0, "earned_points": 0, "question_sent": False}
+    sync_test_progress(state)
+    return state
 
 def get_teacher_class_tests(teacher_id: int, class_id: int) -> list[dict]:
     with get_connection() as conn:
@@ -527,6 +745,13 @@ def get_test_lock(user_id: str) -> asyncio.Lock:
     return test_locks[user_id]
 
 # ======================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
+def build_profile_text(user: dict) -> str:
+    text = f"👤 Профиль:\nФИО: {user['full_name']}\nРоль: {user['role']}"
+    if user["role"] == "student":
+        text += f"\nБаллы: {get_student_points(user['id'])}"
+    return text
+
+
 def build_main_menu(role: str) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     if role == "teacher":
@@ -538,6 +763,7 @@ def build_main_menu(role: str) -> InlineKeyboardBuilder:
             CallbackButton(text="Мои классы", payload="menu_my_classes"),
             CallbackButton(text="Тесты", payload="menu_teacher_tests"),
         )
+        builder.row(CallbackButton(text="Создать тест", payload="menu_create_test"))
     else:
         builder.row(CallbackButton(text="Мой класс", payload="menu_my_class"))
         builder.row(CallbackButton(text="Мои тесты", payload="menu_my_tests"))
@@ -552,6 +778,7 @@ def build_error_keyboard() -> InlineKeyboardBuilder:
 def build_teacher_tests_menu() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.row(CallbackButton(text="Выдать тест", payload="menu_give_test"))
+    builder.row(CallbackButton(text="Созданные тесты", payload="menu_created_tests"))
     builder.row(CallbackButton(text="Результаты тестов", payload="menu_test_results"))
     builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
     return builder
@@ -617,6 +844,7 @@ async def set_bot_commands():
     commands = [
         BotCommand(name="start", description="Запустить бота"),
         BotCommand(name="register", description="Регистрация"),
+        BotCommand(name="help", description="Показать справку"),
         BotCommand(name="profile", description="Мой профиль и меню"),
         BotCommand(name="create_class", description="Создать класс (учитель)"),
         BotCommand(name="invite", description="Пригласить ученика (учитель)"),
@@ -681,7 +909,7 @@ async def logout_no(event: MessageCallback):
     if user:
         builder = build_main_menu(user["role"])
         await event.edit(
-            text=f"👤 Профиль:\nФИО: {user['full_name']}\nРоль: {user['role']}",
+            text=build_profile_text(user),
             attachments=[builder.as_markup()]
         )
     else:
@@ -907,28 +1135,38 @@ async def view_class(event: MessageCallback):
     if not user or user["role"] != "teacher":
         await event.answer(notification="Только учитель может просматривать классы.")
         return
-    class_id_str = event.callback.payload.rsplit("_", 1)[-1]
-    if not class_id_str.isdigit():
+    match = re.fullmatch(r"view_class_([0-9]{1,19})(?:_([0-9]{1,9}))?", event.callback.payload)
+    if not match or not 0 < int(match[1]) <= 9223372036854775807:
         builder = build_error_keyboard()
         await event.edit(text="❌ Некорректный запрос.", attachments=[builder.as_markup()])
         return
-    class_id = int(class_id_str)
+    class_id = int(match[1])
+    cls = get_class_by_id(class_id)
+    if not cls or cls["teacher_id"] != user["id"]:
+        await event.answer(notification="Класс не найден или принадлежит другому учителю.")
+        return
+    page = int(match[2] or 0)
     students = get_class_students(class_id)
-    with get_connection() as conn:
-        row = conn.execute("SELECT name FROM classes WHERE id = ?", (class_id,)).fetchone()
-    class_name = row["name"] if row else "Класс"
+    items, page, pages, _ = get_report_page(students, page)
+    class_name = escape(short_report_text(cls["name"], 60))
+    text = f"📚 Класс «{class_name}»\nУчеников: {len(students)}.\n\n"
     if students:
-        lines = []
-        for s in students:
-            parts = s["full_name"].split()
-            lines.append(f"{parts[0]}, {parts[1]}" if len(parts) >= 2 else s["full_name"])
-        text = f"📚 Класс «{class_name}»:\n\n" + "\n".join(lines)
+        # Ограничение учитывает и увеличение HTML после экранирования символов.
+        names = [short_report_text(" ".join(s["full_name"].split()[:2]), 50) for s in items]
+        width = max(len("Фамилия Имя"), *(len(name) for name in names))
+        lines = [f"{'Фамилия Имя':<{width}} | Баллы"]
+        lines.extend(f"{name:<{width}} | {student['points']}" for name, student in zip(names, items))
+        text += "<pre>" + escape("\n".join(lines)) + "</pre>"
+        text += "\n\nБаллы накоплены за все тесты ученика."
     else:
-        text = f"📚 Класс «{class_name}»:\n\nУчеников пока нет."
+        text += "Учеников пока нет."
+    text += f"\nСтраница {page + 1}/{pages}."
     builder = InlineKeyboardBuilder()
+    add_report_pagination(builder, page, pages, f"view_class_{class_id}")
+    builder.row(CallbackButton(text="Обновить", payload=f"view_class_{class_id}_{page}"))
     builder.row(CallbackButton(text="Назад к классам", payload="menu_my_classes"))
     builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
-    await event.edit(text=text, attachments=[builder.as_markup()])
+    await event.edit(text=text, attachments=[builder.as_markup()], format="html")
 
 @dp.message_callback(F.callback.payload == "back_to_profile")
 async def back_to_profile(event: MessageCallback):
@@ -938,7 +1176,7 @@ async def back_to_profile(event: MessageCallback):
     if user:
         builder = build_main_menu(user["role"])
         await event.edit(
-            text=f"👤 Профиль:\nФИО: {user['full_name']}\nРоль: {user['role']}",
+            text=build_profile_text(user),
             attachments=[builder.as_markup()]
         )
     else:
@@ -957,7 +1195,7 @@ async def cmd_profile(event: MessageCreated):
     if cached_user:
         builder = build_main_menu(cached_user["role"])
         await event.message.answer(
-            f"👤 Профиль:\nФИО: {cached_user['full_name']}\nРоль: {cached_user['role']}",
+            build_profile_text(cached_user),
             attachments=[builder.as_markup()]
         )
     else:
@@ -1033,7 +1271,7 @@ async def menu_teacher_tests(event: MessageCallback):
         return
     user_states.pop(str(event.from_user.user_id), None)
     await safe_test_callback(
-        event, text="📝 Тесты\nВыдайте новый тест или посмотрите результаты учеников.",
+        event, text="📝 Тесты\nВыдайте тест, откройте созданные вами тесты или посмотрите результаты учеников.",
         attachments=[build_teacher_tests_menu().as_markup()]
     )
 
@@ -1168,7 +1406,432 @@ async def view_test_results(event: MessageCallback):
     await safe_test_callback(event, text="\n".join(lines), attachments=[builder.as_markup()])
 
 
+# ======================= СОЗДАНИЕ ТЕСТА ИЗ EXCEL =======================
+class ExcelImportError(ValueError):
+    """Ошибка таблицы, которую можно показать учителю."""
+
+
+def parse_excel_question_number(value) -> int:
+    if isinstance(value, bool):
+        raise ExcelImportError("В первой колонке нужен положительный целый номер вопроса.")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, (int, str)) or not re.fullmatch(r"[0-9]+", str(value).strip()):
+        raise ExcelImportError("В первой колонке нужен положительный целый номер вопроса.")
+    number = int(str(value).strip())
+    if not 0 < number <= 2147483647:
+        raise ExcelImportError("Номер вопроса должен быть от 1 до 2147483647.")
+    return number
+
+
+def parse_excel_difficulty(value) -> int:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or str(value).strip() not in ("1", "2", "3"):
+        raise ExcelImportError("В пятой колонке «Сложность» нужно целое число 1, 2 или 3: 1 — Легкий, 2 — Средний, 3 — Сложный.")
+    return int(str(value).strip())
+
+
+def validate_imported_question(question: dict, title: str = ""):
+    parse_excel_difficulty(question.get("difficulty"))
+    body = question.get("question_text")
+    if not isinstance(body, str) or not body.strip():
+        raise ExcelImportError("Во второй колонке нужен текст вопроса и четыре варианта ответа.")
+    options = parse_question_options(question.get("options", ""))
+    answer = question.get("correct_answer")
+    if not isinstance(answer, str) or answer.strip().upper() not in ("А", "Б", "В", "Г"):
+        raise ExcelImportError("В третьей колонке нужна одна русская буква: а, б, в или г.")
+    explanation = question.get("explanation") or ""
+    if not isinstance(explanation, str):
+        raise ExcelImportError("Пояснение должно быть текстом.")
+    options_text = "\n".join(f"{letter} — {value}" for letter, value in options)
+    if len(body) + len(options_text) + max(len(title), MAX_TEST_TITLE_LENGTH) + 150 > 4000:
+        raise ExcelImportError("Вопрос с вариантами слишком длинный для одного сообщения MAX.")
+    if len(body) + len(explanation) + 200 > 4000:
+        raise ExcelImportError("Вопрос с пояснением слишком длинный для одного сообщения MAX.")
+
+
+def split_excel_question(value: str) -> tuple[str, str]:
+    if not isinstance(value, str) or not value.strip():
+        raise ExcelImportError("Во второй колонке нужен текст вопроса и варианты А, Б, В, Г.")
+    raw = value.strip().replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(re.finditer(r"(?:^|(?<=[\n,;?.]))[ \t]*([АБВГ])\s*[—–\-).:]\s*", raw, re.IGNORECASE))
+    if len(matches) != 4 or tuple(m[1].upper() for m in matches) != ("А", "Б", "В", "Г"):
+        raise ExcelImportError("Во второй колонке после вопроса запишите четыре варианта по строкам: А) ..., Б) ..., В) ..., Г) ...")
+    body = raw[:matches[0].start()].strip()
+    values = [raw[m.end():matches[i + 1].start() if i < 3 else len(raw)].strip().rstrip(",;").strip()
+              for i, m in enumerate(matches)]
+    if not body or any(not value for value in values):
+        raise ExcelImportError("Текст вопроса и все четыре варианта должны быть заполнены.")
+    return body, json.dumps(values, ensure_ascii=False)
+
+
+def parse_test_excel(data: bytes) -> list[dict]:
+    if not data or len(data) > MAX_EXCEL_FILE_BYTES:
+        raise ExcelImportError("Отправьте непустой файл .xlsx размером не более 5 МБ.")
+    try:
+        with ZipFile(BytesIO(data)) as archive:
+            parts = archive.infolist()
+            if len(parts) > 256 or sum(part.file_size for part in parts) > MAX_EXCEL_UNPACKED_BYTES:
+                raise ExcelImportError("Таблица слишком большая. Удалите лишние листы и форматирование.")
+            names = {part.filename for part in parts}
+            if "xl/workbook.xml" not in names or "[Content_Types].xml" not in names:
+                raise ExcelImportError("Файл не является книгой Excel .xlsx.")
+            # XLSX не требует DTD. Проверяем XML до загрузки sharedStrings и листов.
+            for part in parts:
+                if part.flag_bits & 1:
+                    raise ExcelImportError("Снимите пароль с файла Excel перед загрузкой.")
+                if part.filename.lower().endswith((".xml", ".rels")):
+                    xml = archive.read(part).replace(b"\x00", b"").upper()
+                    if b"<!DOCTYPE" in xml or b"<!ENTITY" in xml:
+                        raise ExcelImportError("Файл содержит неподдерживаемую XML-структуру. Сохраните его заново как .xlsx.")
+        workbook = load_workbook(BytesIO(data), read_only=True, data_only=False, keep_links=False)
+    except ExcelImportError:
+        raise
+    except Exception as exc:
+        raise ExcelImportError("Не удалось открыть Excel. Сохраните таблицу как .xlsx без пароля.") from exc
+
+    questions = []
+    numbers = set()
+    rows_seen = 0
+    try:
+        for sheet in workbook.worksheets:
+            sheet.reset_dimensions()
+            first_nonempty = True
+            for row_number, cells in enumerate(sheet.iter_rows(), 1):
+                rows_seen += 1
+                if rows_seen > MAX_EXCEL_ROWS:
+                    raise ExcelImportError(f"В книге слишком много строк: допустимо до {MAX_EXCEL_ROWS}, включая пустые.")
+                values = [cell.value for cell in cells]
+                if not any(value is not None and str(value).strip() for value in values):
+                    continue
+                location = f"Лист «{sheet.title}», строка {row_number}: "
+                if any(value is not None and str(value).strip() for value in values[5:]):
+                    raise ExcelImportError(location + "нужны ровно пять колонок; уберите данные правее пятой.")
+                values = (values + [None] * 5)[:5]
+                if any(cell.data_type in ("f", "e") for cell in cells[:5]):
+                    raise ExcelImportError(location + "используйте обычные значения, без формул и ошибок Excel.")
+                # Названия заголовков не используются; порядок колонок фиксирован.
+                if first_nonempty:
+                    first_nonempty = False
+                    first = values[0]
+                    if first is None or (isinstance(first, str) and not re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", first.strip())):
+                        try:
+                            split_excel_question(values[1])
+                        except ExcelImportError:
+                            continue
+                        # Строку с готовым вопросом нельзя молча принять за шапку.
+                try:
+                    number = parse_excel_question_number(values[0])
+                    if number in numbers:
+                        raise ExcelImportError(f"повторяется номер вопроса {number}; номера в книге должны быть уникальными.")
+                    body, options = split_excel_question(values[1])
+                    answer = values[2].strip().upper() if isinstance(values[2], str) else ""
+                    explanation = str(values[3]).strip() if values[3] is not None else ""
+                    question = {"question_number": number, "question_text": body, "options": options,
+                                "correct_answer": answer, "explanation": explanation,
+                                "difficulty": parse_excel_difficulty(values[4])}
+                    validate_imported_question(question)
+                except ValueError as exc:
+                    raise ExcelImportError(location + str(exc)) from exc
+                questions.append(question)
+                numbers.add(number)
+                if len(questions) > MAX_IMPORTED_QUESTIONS:
+                    raise ExcelImportError(f"В одном тесте допускается до {MAX_IMPORTED_QUESTIONS} вопросов.")
+    except ExcelImportError:
+        raise
+    except Exception as exc:
+        raise ExcelImportError("Не удалось прочитать строки Excel. Проверьте формат файла.") from exc
+    finally:
+        workbook.close()
+    if not questions:
+        raise ExcelImportError("В таблице нет вопросов. Добавьте строки под заголовками.")
+    return sorted(questions, key=lambda question: question["question_number"])
+
+
+def validate_excel_download_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 443):
+            raise ValueError()
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and (not address.is_global or (getattr(address, "ipv4_mapped", None) and not address.ipv4_mapped.is_global)):
+            raise ValueError()
+    except (TypeError, ValueError) as exc:
+        raise ExcelImportError("Не удалось получить ссылку на файл. Прикрепите Excel заново как файл.") from exc
+    return url
+
+
+class PublicFileResolver(aiohttp.abc.AbstractResolver):
+    def __init__(self):
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        records = await self._resolver.resolve(host, port, family)
+        for record in records:
+            address = ipaddress.ip_address(record["host"])
+            if not address.is_global or (getattr(address, "ipv4_mapped", None) and not address.ipv4_mapped.is_global):
+                raise OSError("Недопустимый адрес сервера файла")
+        return records
+
+    async def close(self):
+        await self._resolver.close()
+
+
+async def download_excel_attachment(attachment) -> bytes:
+    filename = getattr(attachment, "filename", None)
+    if not isinstance(filename, str) or PurePath(filename).suffix.lower() != ".xlsx":
+        raise ExcelImportError("Отправьте файл .xlsx. Старый формат .xls нужно пересохранить в Excel как .xlsx.")
+    size = getattr(attachment, "size", None)
+    if isinstance(size, int) and size > MAX_EXCEL_FILE_BYTES:
+        raise ExcelImportError("Размер файла не должен превышать 5 МБ.")
+    url = validate_excel_download_url(getattr(getattr(attachment, "payload", None), "url", None))
+    resolver = PublicFileResolver()
+    try:
+        connector = aiohttp.TCPConnector(resolver=resolver)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30),
+                                         trust_env=False, cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
+                                         headers={"Accept-Encoding": "identity"}) as session:
+            for redirect in range(4):
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get("Location")
+                        if not location or redirect == 3:
+                            raise ExcelImportError("Не удалось скачать вложение. Прикрепите Excel заново.")
+                        url = validate_excel_download_url(urljoin(url, location))
+                        continue
+                    response.raise_for_status()
+                    if response.content_length and response.content_length > MAX_EXCEL_FILE_BYTES:
+                        raise ExcelImportError("Размер файла не должен превышать 5 МБ.")
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        data.extend(chunk)
+                        if len(data) > MAX_EXCEL_FILE_BYTES:
+                            raise ExcelImportError("Размер файла не должен превышать 5 МБ.")
+                    return bytes(data)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        raise ExcelImportError("Не удалось скачать вложение. Попробуйте отправить файл ещё раз.") from exc
+    finally:
+        await resolver.close()
+    raise ExcelImportError("Не удалось скачать вложение.")
+
+
+def build_create_test_keyboard() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="Отмена", payload="back_to_profile"))
+    return builder
+
+
+@dp.message_callback(F.callback.payload == "menu_create_test")
+async def menu_create_test(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    if not teacher:
+        return
+    user_states[str(event.from_user.user_id)] = {"action": "create_test", "step": "name", "teacher_id": teacher["id"]}
+    await safe_test_callback(event, text=f"Введите название нового теста (до {MAX_TEST_TITLE_LENGTH} символов).",
+                             attachments=[build_create_test_keyboard().as_markup()])
+
+
+async def handle_test_creation_message(event: MessageCreated, state: dict):
+    user_id = str(event.from_user.user_id)
+    teacher = auth_cache.get(user_id)
+    if not teacher or teacher["role"] != "teacher" or teacher["id"] != state.get("teacher_id"):
+        if user_states.get(user_id) is state:
+            user_states.pop(user_id, None)
+        await event.message.answer("Сессия создания теста истекла. Войдите как учитель и нажмите «Создать тест».",
+                                   attachments=[build_error_keyboard().as_markup()])
+        return
+    body = event.message.body
+    text = (getattr(body, "text", None) or "").strip()
+    files = [item for item in (getattr(body, "attachments", None) or []) if getattr(item, "type", None) == "file"]
+    if state.get("step") == "processing":
+        await event.message.answer("Таблица уже обрабатывается. Дождитесь результата.")
+        return
+    if state.get("step") == "name":
+        if text.startswith("/"):
+            return
+        title = " ".join(text.split())
+        if files or not title or len(title) > MAX_TEST_TITLE_LENGTH:
+            await event.message.answer(f"Сначала отправьте название отдельным текстовым сообщением: от 1 до {MAX_TEST_TITLE_LENGTH} символов.",
+                                       attachments=[build_create_test_keyboard().as_markup()])
+            return
+        state.update(title=title, step="upload")
+        await event.message.answer(
+            f"Теперь отправьте Excel-файл .xlsx для теста «{title}».\n\n"
+            "Нужны пять колонок в таком порядке:\n"
+            "1. Номер вопроса.\n2. Вопрос и четыре варианта ответа.\n3. Правильная буква: а, б, в или г.\n4. Пояснение.\n"
+            "5. Сложность: 1 — Легкий, 2 — Средний, 3 — Сложный.\n\n"
+            "Названия заголовков могут быть любыми. В одной строке — один вопрос.\n"
+            "Во второй колонке пишите, например:\nСколько будет 2 + 2?\nА) 3\nБ) 4\nВ) 5\nГ) 6\n\n"
+            f"До {MAX_IMPORTED_QUESTIONS} вопросов, файл до 5 МБ. Прикрепите файл следующим сообщением.",
+            attachments=[build_create_test_keyboard().as_markup()]
+        )
+        return
+    if len(files) != 1:
+        await event.message.answer("Прикрепите один Excel-файл .xlsx с пятью колонками.",
+                                   attachments=[build_create_test_keyboard().as_markup()])
+        return
+    # Фиксируем обработку до первого await, чтобы два файла не создали два теста.
+    state["step"] = "processing"
+    try:
+        data = await download_excel_attachment(files[0])
+        questions = await asyncio.to_thread(parse_test_excel, data)
+        current_teacher = auth_cache.get(user_id)
+        if user_states.get(user_id) is not state:
+            return  # Учитель отменил создание или открыл другой сценарий.
+        if not current_teacher or current_teacher["role"] != "teacher" or current_teacher["id"] != state["teacher_id"]:
+            user_states.pop(user_id, None)
+            await event.message.answer("Время входа истекло. Войдите снова и создайте тест ещё раз.",
+                                       attachments=[build_error_keyboard().as_markup()])
+            return
+        template_id = create_test_template(teacher["id"], state["title"], questions,
+                                           source_message_id=getattr(body, "mid", None))
+    except (ExcelImportError, ValueError) as exc:
+        if user_states.get(user_id) is state:
+            state["step"] = "upload"
+            await event.message.answer(f"Не удалось импортировать тест: {exc}\n\nИсправьте таблицу и отправьте её ещё раз.",
+                                       attachments=[build_create_test_keyboard().as_markup()])
+        return
+    except Exception:
+        logging.exception("Ошибка импорта теста учителя %s", teacher["id"])
+        if user_states.get(user_id) is state:
+            state["step"] = "upload"
+            await event.message.answer("Не удалось сохранить тест. Попробуйте отправить файл ещё раз.",
+                                       attachments=[build_create_test_keyboard().as_markup()])
+        return
+    user_states.pop(user_id, None)
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="Выдать этот тест", payload=f"select_custom_test_{template_id}"))
+    builder.row(CallbackButton(text="Созданные тесты", payload="menu_created_tests"))
+    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
+    await event.message.answer(f"✅ Тест «{state['title']}» создан.\nВопросов: {len(questions)}.\n"
+                               "Он доступен в разделе «Тесты» → «Созданные тесты» и в списке выдачи.",
+                               attachments=[builder.as_markup()])
+
+
+async def show_created_tests(event: MessageCallback, teacher: dict, page: int = 0):
+    templates = get_teacher_test_templates(teacher["id"])
+    items, page, pages, _ = get_report_page(templates, page)
+    builder = InlineKeyboardBuilder()
+    for template in items:
+        builder.row(CallbackButton(text=short_report_text(f"№{template['id']}: {template['title']} ({template['question_count']})", 128),
+                                   payload=f"view_custom_test_{template['id']}"))
+    add_report_pagination(builder, page, pages, "created_tests_page")
+    builder.row(CallbackButton(text="Создать тест", payload="menu_create_test"))
+    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
+    text = f"Созданные вами тесты: {len(templates)}.\nВыберите тест. Страница {page + 1}/{pages}." if templates else "У вас пока нет созданных тестов. Нажмите «Создать тест», чтобы загрузить Excel."
+    await safe_test_callback(event, text=text, attachments=[builder.as_markup()])
+
+
+@dp.message_callback(F.callback.payload == "menu_created_tests")
+async def menu_created_tests(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    if teacher:
+        user_states.pop(str(event.from_user.user_id), None)
+        await show_created_tests(event, teacher)
+
+
+@dp.message_callback(F.callback.payload.startswith("created_tests_page_"))
+async def created_tests_page(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    values = parse_report_callback(event.callback.payload, "created_tests_page_", 1)
+    if teacher and values:
+        await show_created_tests(event, teacher, values[0])
+    elif teacher:
+        await safe_test_callback(event, notification="Не удалось открыть страницу. Откройте «Созданные тесты».")
+
+
+@dp.message_callback(F.callback.payload.startswith("view_custom_test_"))
+async def view_custom_test(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    if not teacher:
+        return
+    values = parse_report_callback(event.callback.payload, "view_custom_test_", 1)
+    template = get_test_template(values[0], teacher["id"]) if values else None
+    if not template:
+        await safe_test_callback(event, notification="Тест не найден или принадлежит другому учителю.")
+        return
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="Выдать тест", payload=f"select_custom_test_{template['id']}"))
+    builder.row(CallbackButton(text="Созданные тесты", payload="menu_created_tests"))
+    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
+    await safe_test_callback(event, text=f"📝 {template['title']}\nНомер: {template['id']}\nВопросов: {template['question_count']}\n"
+                             f"Создан: {format_report_date(template['created_at'])}\n\nВыберите класс для выдачи кнопкой ниже.",
+                             attachments=[builder.as_markup()])
+
+
+async def show_test_class_selection(event: MessageCallback, teacher: dict, topic: str, page: int = 0):
+    classes = get_teacher_classes(teacher["id"])
+    if not classes:
+        await safe_test_callback(event, text="Сначала создайте класс и пригласите учеников.",
+                                 attachments=[build_teacher_tests_back_keyboard().as_markup()])
+        return
+    items, page, pages, _ = get_report_page(classes, page)
+    builder = InlineKeyboardBuilder()
+    for cls in items:
+        builder.row(CallbackButton(text=short_report_text(cls["name"], 128), payload=f"test_class_{cls['id']}"))
+    add_report_pagination(builder, page, pages, "test_targets_page")
+    builder.row(CallbackButton(text="Всем классам", payload="test_class_all"))
+    builder.row(CallbackButton(text="Назад к тестам", payload="menu_give_test"))
+    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
+    await safe_test_callback(event, text=f"Тест: «{topic}». Выберите класс, которому выдать тест:",
+                             attachments=[builder.as_markup()])
+
+
+@dp.message_callback(F.callback.payload.startswith("test_targets_page_"))
+async def test_targets_page(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    if not teacher:
+        return
+    state = user_states.get(str(event.from_user.user_id))
+    values = parse_report_callback(event.callback.payload, "test_targets_page_", 1)
+    if not values or not state or state.get("action") != "give_test" or not state.get("topic") or state.get("teacher_id") != teacher["id"]:
+        await safe_test_callback(event, notification="Выберите тест заново через меню «Тесты».")
+        return
+    await show_test_class_selection(event, teacher, state["topic"], values[0])
+
+
+@dp.message_callback(F.callback.payload.startswith("select_custom_test_"))
+async def select_custom_test(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    if not teacher:
+        return
+    values = parse_report_callback(event.callback.payload, "select_custom_test_", 1)
+    template = get_test_template(values[0], teacher["id"]) if values else None
+    if not template:
+        await safe_test_callback(event, notification="Тест не найден или принадлежит другому учителю.")
+        return
+    user_states[str(event.from_user.user_id)] = {"action": "give_test", "step": "class", "teacher_id": teacher["id"],
+                                               "topic": template["title"], "template_id": template["id"], "topics": get_topics()}
+    await show_test_class_selection(event, teacher, template["title"])
+
+
 # ======================= ВЫДАЧА ТЕСТА (УЧИТЕЛЬ) =======================
+async def show_give_test_catalog(event: MessageCallback, teacher: dict, page: int = 0):
+    topics = get_topics()
+    templates = get_teacher_test_templates(teacher["id"])
+    entries = [(topic, f"select_topic_{i}") for i, topic in enumerate(topics)]
+    entries.extend((f"№{t['id']}: {t['title']}", f"select_custom_test_{t['id']}") for t in templates)
+    user_states[str(event.from_user.user_id)] = {"action": "give_test", "step": "topic", "teacher_id": teacher["id"], "topics": topics}
+    if not entries:
+        builder = build_teacher_tests_back_keyboard()
+        builder.row(CallbackButton(text="Создать тест", payload="menu_create_test"))
+        await safe_test_callback(event, text="Вопросы ещё не загружены. Создайте тест из Excel.", attachments=[builder.as_markup()])
+        return
+    items, page, pages, _ = get_report_page(entries, page)
+    builder = InlineKeyboardBuilder()
+    for title, payload in items:
+        builder.row(CallbackButton(text=short_report_text(title, 128), payload=payload))
+    add_report_pagination(builder, page, pages, "test_catalog_page")
+    builder.row(CallbackButton(text="Созданные тесты", payload="menu_created_tests"))
+    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
+    await safe_test_callback(event, text=f"Выберите тему или созданный вами тест. Страница {page + 1}/{pages}.",
+                             attachments=[builder.as_markup()])
+
+
 @dp.message_callback(F.callback.payload == "menu_give_test")
 async def menu_give_test(event: MessageCallback):
     user_id = str(event.from_user.user_id)
@@ -1176,18 +1839,17 @@ async def menu_give_test(event: MessageCallback):
     if not user or user["role"] != "teacher":
         await event.answer(notification="Только учитель может выдавать тесты.")
         return
-    topics = get_topics()
-    if not topics:
-        builder = build_teacher_tests_back_keyboard()
-        await event.edit(text="Вопросы ещё не загружены.", attachments=[builder.as_markup()])
-        return
-    builder = InlineKeyboardBuilder()
-    for i, topic in enumerate(topics):
-        builder.row(CallbackButton(text=topic, payload=f"select_topic_{i}"))
-    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
-    # сохраняем список тем в состоянии, чтобы потом по индексу найти
-    user_states[user_id] = {"action": "give_test", "step": "topic", "topics": topics}
-    await event.edit(text="Выберите тему теста:", attachments=[builder.as_markup()])
+    await show_give_test_catalog(event, user)
+
+
+@dp.message_callback(F.callback.payload.startswith("test_catalog_page_"))
+async def test_catalog_page(event: MessageCallback):
+    teacher = await require_teacher_for_tests(event)
+    values = parse_report_callback(event.callback.payload, "test_catalog_page_", 1)
+    if teacher and values:
+        await show_give_test_catalog(event, teacher, values[0])
+    elif teacher:
+        await safe_test_callback(event, notification="Выберите тест заново через меню «Тесты».")
 
 @dp.message_callback(F.callback.payload.startswith("select_topic_"))
 async def select_topic(event: MessageCallback):
@@ -1209,21 +1871,9 @@ async def select_topic(event: MessageCallback):
     topic = topics[idx]
     state["topic"] = topic
     state["step"] = "class"
-    # показываем список классов и кнопку "Всем классам"
-    classes = get_teacher_classes(teacher["id"])
-    if not classes:
-        await event.edit(text="Сначала создайте класс и пригласите учеников.", attachments=[build_teacher_tests_back_keyboard().as_markup()])
-        return
-    builder = InlineKeyboardBuilder()
-    for cls in classes:
-        builder.row(CallbackButton(text=cls["name"], payload=f"test_class_{cls['id']}"))
-    builder.row(CallbackButton(text="Всем классам", payload="test_class_all"))
-    builder.row(CallbackButton(text="Назад к темам", payload="menu_give_test"))
-    builder.row(CallbackButton(text="В меню тестов", payload="menu_teacher_tests"))
-    await event.edit(
-        text=f"Тема: «{topic}». Выберите класс, которому выдать тест:",
-        attachments=[builder.as_markup()]
-    )
+    state["teacher_id"] = teacher["id"]
+    state["template_id"] = None
+    await show_test_class_selection(event, teacher, topic)
 
 @dp.message_callback(F.callback.payload.startswith("test_class_"))
 async def test_class_selected(event: MessageCallback):
@@ -1264,8 +1914,12 @@ async def test_class_selected(event: MessageCallback):
         target_desc = f"классу «{cls['name']}»"
         class_id_for_test = class_id
 
+    template_id = state.get("template_id")
+    if state.get("teacher_id", teacher["id"]) != teacher["id"]:
+        await safe_test_callback(event, notification="Сессия выдачи изменилась. Выберите тест заново.")
+        return
     try:
-        questions = prepare_test_questions(topic)
+        questions = prepare_test_questions(topic, template_id=template_id, teacher_id=teacher["id"])
     except ValueError:
         logging.exception("Некорректные вопросы по теме %s", topic)
         await event.answer(notification="В вопросах этой темы ошибка: проверьте варианты и правильные ответы в базе.")
@@ -1275,7 +1929,8 @@ async def test_class_selected(event: MessageCallback):
         return
 
     # Создаём тест
-    test_id = create_test(teacher["id"], topic, class_id_for_test)
+    test_id = create_test(teacher["id"], topic, class_id_for_test, template_id=template_id)
+    user_states.pop(user_id, None)
 
     # Собираем учеников из выбранных классов
     students = []
@@ -1305,7 +1960,6 @@ async def test_class_selected(event: MessageCallback):
             except Exception as e:
                 logging.error(f"Не удалось отправить тест ученику {s['full_name']}: {e}")
 
-    user_states.pop(user_id, None)
     result_text = (
         f"✅ Тест по теме «{topic}» выдан {target_desc}.\n"
         f"Приглашение отправлено {sent_count} ученикам."
@@ -1349,15 +2003,22 @@ def parse_question_options(raw: str) -> list[tuple[str, str]]:
     return list(zip(letters, (value.strip() for value in values)))
 
 
-def prepare_test_questions(topic: str) -> list[dict]:
-    questions = get_questions_by_topic(topic)
+def prepare_test_questions(topic: str, *, template_id: int | None = None, teacher_id: int | None = None) -> list[dict]:
+    if template_id is not None:
+        template = get_test_template(template_id, teacher_id) if teacher_id is not None else None
+        if not template:
+            raise ValueError("Созданный тест не найден или принадлежит другому учителю.")
+        questions = get_template_questions(template_id, teacher_id)
+    else:
+        questions = get_questions_by_topic(topic)
     for question in questions:
+        question["difficulty"] = parse_excel_difficulty(question["difficulty"])
         question["parsed_options"] = parse_question_options(question["options"])
         question["correct_answer"] = question["correct_answer"].strip().upper()
         if question["correct_answer"] not in ("А", "Б", "В", "Г"):
             raise ValueError(f"Некорректный правильный ответ в вопросе {question['id']}")
         options_text = "\n".join(f"{letter} — {value}" for letter, value in question["parsed_options"])
-        if len(question["question_text"]) + len(options_text) + len(topic) + 100 > 4000:
+        if len(question["question_text"]) + len(options_text) + len(topic) + 150 > 4000:
             raise ValueError(f"Слишком длинный вопрос {question['id']}")
     return questions
 
@@ -1458,7 +2119,7 @@ async def notify_test_delivery_failure(user_id: str, test_id: int):
     builder = build_test_resume_keyboard(test_id)
     await deliver_test_message(
         user_id,
-        "⚠️ Не удалось доставить вопрос или результат. Ваши принятые ответы сохранены в текущей сессии.\n"
+        "⚠️ Не удалось доставить вопрос или результат. Ваши принятые ответы сохранены в базе данных.\n"
         "Нажмите «Продолжить тест». Также тест можно открыть через /tests.",
         [builder.as_markup()]
     )
@@ -1515,6 +2176,15 @@ async def start_test(event: MessageCallback):
         if not is_test_active(test):
             if state and state["test_id"] == test_id:
                 await finish_student_test(user_id, user_id, expired=True)
+            elif get_student_test_answers(test_id, user["id"]):
+                # После перезапуска завершаем начатое прохождение по сохранённым ответам.
+                try:
+                    expired_state = restore_test_state(test, user["id"])
+                    save_result(test_id, user["id"], expired_state["score"], len(expired_state["questions"]))
+                except (ValueError, sqlite3.Error):
+                    logging.exception("Не удалось завершить истёкший тест %s", test_id)
+                    await safe_test_callback(event, notification="Не удалось сохранить результат. Попробуйте открыть тест ещё раз.")
+                    return
             await safe_test_callback(event, text="⏰ Срок прохождения этого теста истёк.", attachments=[build_main_menu("student").as_markup()])
             return
 
@@ -1530,24 +2200,11 @@ async def start_test(event: MessageCallback):
 
         if state is None:
             try:
-                questions = prepare_test_questions(test["topic"])
+                active_tests[user_id] = restore_test_state(test, user["id"])
             except ValueError:
                 logging.exception("Ошибка вопросов теста %s", test_id)
                 await safe_test_callback(event, notification="Вопросы теста заполнены некорректно. Сообщите учителю.")
                 return
-            if not questions:
-                await safe_test_callback(event, notification="В тесте пока нет вопросов.")
-                return
-            active_tests[user_id] = {
-                "test_id": test_id,
-                "student_id": user["id"],
-                "topic": test["topic"],
-                "ends_at": test["ends_at"],
-                "questions": questions,
-                "current": 0,
-                "score": 0,
-                "question_sent": False,
-            }
 
         user_states.pop(user_id, None)
         # Не сбрасываем прогресс при повторном нажатии. Доставляем текущий вопрос.
@@ -1565,11 +2222,17 @@ async def finish_student_test(max_user_id, user_id: str, *, expired: bool = Fals
     if not state:
         return False
     # Сохраняем по ID ученика, зафиксированному при старте, независимо от TTL входа.
-    save_result(state["test_id"], state["student_id"], state["score"], len(state["questions"]))
-    result = get_result(state["test_id"], state["student_id"])
+    try:
+        sync_test_progress(state)
+        save_result(state["test_id"], state["student_id"], state["score"], len(state["questions"]))
+        result = get_result(state["test_id"], state["student_id"])
+    except sqlite3.Error:
+        logging.exception("Не удалось сохранить итог теста %s ученика %s", state["test_id"], state["student_id"])
+        return False  # Состояние и ответы сохраняются; кнопку продолжения можно нажать снова.
     active_tests.pop(user_id, None)
     title = "⏰ Время на тест истекло." if expired else "🏁 Тест завершён!"
     text = f"{title}\nВаш результат: {result['score']}/{result['total']} правильных ответов."
+    text += f"\nБаллы за тест: {state['earned_points']}.\nВсего баллов: {get_student_points(state['student_id'])}."
     return await deliver_test_message(max_user_id, text, [build_main_menu("student").as_markup()])
 
 
@@ -1577,6 +2240,7 @@ async def send_question(max_user_id, user_id: str) -> bool:
     state = active_tests.get(user_id)
     if not state:
         return False
+    sync_test_progress(state)
     idx = state["current"]
     questions = state["questions"]
     if idx >= len(questions):
@@ -1588,7 +2252,8 @@ async def send_question(max_user_id, user_id: str) -> bool:
     options = question["parsed_options"]
     options_text = "\n\n".join(f"{letter} — {value}" for letter, value in options)
     text = (
-        f"Вопрос {idx + 1}/{len(questions)} (тема: {state['topic']}):\n\n"
+        f"Вопрос {idx + 1}/{len(questions)} (тема: {state['topic']}):\n"
+        f"Сложность: {DIFFICULTY_NAMES[question['difficulty']]}\n\n"
         f"{question['question_text']}\n\n{options_text}\n\nВыберите ответ:"
     )
     builder = InlineKeyboardBuilder()
@@ -1641,22 +2306,34 @@ async def handle_answer(event: MessageCallback):
             return
         question = questions[idx]
         correct = question["correct_answer"]
-        if letter == correct:
-            state["score"] += 1
-            feedback = "✅ Верно!"
-        elif letter == "X":
+        try:
+            saved = record_student_answer(test_id, state["student_id"], question["id"], letter)
+        except ValueError as exc:
+            await safe_test_callback(event, notification=str(exc)[:200])
+            return
+        except sqlite3.Error:
+            logging.exception("Не удалось сохранить ответ ученика %s на вопрос %s", state["student_id"], question["id"])
+            await safe_test_callback(event, notification="Не удалось сохранить ответ. Нажмите выбранный вариант ещё раз.")
+            return
+        # Другой вход того же ученика мог уже сохранить ответ. Первый выбор окончательный.
+        sync_test_progress(state)
+        state["question_sent"] = False
+        if not saved["newly_recorded"]:
+            feedback = "Этот ответ уже принят. Баллы повторно не начисляются."
+        elif saved["is_correct"]:
+            feedback = f"✅ Верно! Начислено баллов: {saved['points']}."
+        elif saved["answer"] == "X":
             feedback = f"⏭ Пропущено. Правильный ответ: {correct}."
         else:
             feedback = f"❌ Неверно. Правильный ответ: {correct}."
         explanation = question.get("explanation")
         detail = feedback + (f"\n{explanation}" if explanation else "")
 
-        # Фиксируем ответ до первого await: повторный callback не начислит балл снова.
-        state["current"] += 1
-        state["question_sent"] = False
+        # Ответ и накопительные баллы уже зафиксированы в одной транзакции.
         await safe_test_callback(
             event,
-            text=f"Вопрос {idx + 1}/{len(questions)}:\n\n{question['question_text']}\n\nВаш ответ: {letter}.\n{detail}",
+            text=f"Вопрос {idx + 1}/{len(questions)}:\nСложность: {DIFFICULTY_NAMES[question['difficulty']]}\n\n"
+                 f"{question['question_text']}\n\nВаш ответ: {saved['answer']}.\n{detail}",
             attachments=[],
             notification=feedback[:200]
         )
@@ -1670,12 +2347,16 @@ async def handle_answer(event: MessageCallback):
 async def handle_text(event: MessageCreated):
     user_id = str(event.from_user.user_id)
     state = user_states.get(user_id)
-    text = (event.message.body.text or "").strip()
+    text = (getattr(event.message.body, "text", None) or "").strip()
 
     if not state:
         if text.startswith("/"):
             return
         await event.message.answer("Используйте /start для начала работы.", attachments=[build_error_keyboard().as_markup()])
+        return
+
+    if state.get("action") == "create_test":
+        await handle_test_creation_message(event, state)
         return
 
     if not text:
@@ -1724,6 +2405,7 @@ async def handle_text(event: MessageCreated):
                 builder = build_main_menu(user["role"])
                 welcome_text = f"✅ Добро пожаловать, {user['full_name']}!\nВаша роль: {user['role']}"
                 if user["role"] == "student":
+                    welcome_text += f"\nБаллы: {get_student_points(user['id'])}"
                     resume_test_id = state.get("resume_test_id")
                     if resume_test_id is not None:
                         builder.row(CallbackButton(text="Пройти тест", payload=f"start_test_{resume_test_id}"))
