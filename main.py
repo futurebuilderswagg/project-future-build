@@ -10,7 +10,7 @@ import socket
 from io import BytesIO
 from pathlib import PurePath
 from urllib.parse import urlsplit, urljoin
-from zipfile import ZipFile
+from zipfile import ZipFile, BadZipFile
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from html import escape
@@ -31,6 +31,7 @@ CACHE_TTL = 86400
 DIFFICULTY_NAMES = {1: "Легкий", 2: "Средний", 3: "Сложный"}
 TEST_DURATION_MINUTES = 20
 RESULTS_PAGE_SIZE = 10
+STUDENT_CLASSES_PAGE_SIZE = 5
 MAX_TEST_TITLE_LENGTH = 120
 MAX_IMPORTED_QUESTIONS = 200
 MAX_EXCEL_FILE_BYTES = 5 * 1024 * 1024
@@ -63,6 +64,7 @@ def get_connection():
 
 def init_db():
     with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +92,7 @@ def init_db():
                 class_id INTEGER NOT NULL,
                 student_id INTEGER NOT NULL,
                 status TEXT DEFAULT 'pending',
+                points INTEGER NOT NULL DEFAULT 0 CHECK(typeof(points) = 'integer' AND points >= 0),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(class_id, student_id),
                 FOREIGN KEY (class_id) REFERENCES classes(id),
@@ -154,6 +157,7 @@ def init_db():
             ("questions", {"template_id": "INTEGER REFERENCES test_templates(id)", "question_number": "INTEGER",
                            "difficulty": "INTEGER NOT NULL DEFAULT 1 CHECK(difficulty IN (1, 2, 3))"}),
             ("tests", {"template_id": "INTEGER REFERENCES test_templates(id)"}),
+            ("class_members", {"points": "INTEGER NOT NULL DEFAULT 0 CHECK(typeof(points) = 'integer' AND points >= 0)"}),
         ):
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             for column, declaration in additions.items():
@@ -183,6 +187,24 @@ def init_db():
                 UNIQUE(test_id, student_id, question_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_point_scopes (
+                test_id INTEGER NOT NULL REFERENCES tests(id),
+                student_id INTEGER NOT NULL REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(test_id, student_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_student_classes (
+                test_id INTEGER NOT NULL,
+                student_id INTEGER NOT NULL,
+                class_id INTEGER NOT NULL REFERENCES classes(id),
+                PRIMARY KEY(test_id, student_id, class_id),
+                FOREIGN KEY(test_id, student_id) REFERENCES test_point_scopes(test_id, student_id)
+            )
+        """)
+        migrate_class_points(conn)
         conn.commit()
 
 # ======================= ЗАПОЛНЕНИЕ ВОПРОСОВ =======================
@@ -359,7 +381,7 @@ def get_teacher_classes(teacher_id: int) -> list[dict]:
 def get_class_students(class_id: int) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT u.id, u.full_name, u.max_user_id, u.points
+            SELECT u.id, u.full_name, u.max_user_id, cm.points
             FROM class_members cm
             JOIN users u ON cm.student_id = u.id
             WHERE cm.class_id = ? AND cm.status = 'accepted'
@@ -399,27 +421,42 @@ def set_invitation_status(class_id: int, student_id: int, status: str) -> bool:
         conn.commit()
         return cur.rowcount > 0
 
-def get_student_class(student_id: int) -> dict | None:
+def get_student_classes(student_id: int) -> list[dict]:
     with get_connection() as conn:
-        row = conn.execute("""
-            SELECT c.id, c.name, cm.status
+        rows = conn.execute("""
+            SELECT c.id, c.name, c.teacher_id, teacher.full_name AS teacher_name, cm.status, cm.points
             FROM classes c
             JOIN class_members cm ON c.id = cm.class_id
+            JOIN users teacher ON teacher.id = c.teacher_id
             WHERE cm.student_id = ? AND cm.status = 'accepted'
-            ORDER BY cm.id DESC LIMIT 1
-        """, (student_id,)).fetchone()
-    return dict(row) if row else None
+        """, (student_id,)).fetchall()
+    return sorted((dict(row) for row in rows), key=lambda cls: (
+        cls["name"].casefold().replace("ё", "е"), cls["teacher_name"].casefold().replace("ё", "е"), cls["id"]
+    ))
+
+
+def get_pending_invitations(student_id: int) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT c.id, c.name, c.teacher_id, teacher.full_name AS teacher_name, cm.id AS member_id
+            FROM classes c
+            JOIN class_members cm ON c.id = cm.class_id
+            JOIN users teacher ON teacher.id = c.teacher_id
+            WHERE cm.student_id = ? AND cm.status = 'pending'
+            ORDER BY cm.id
+        """, (student_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_student_class(student_id: int) -> dict | None:
+    """Совместимость со старым кодом; интерфейс использует полный список."""
+    classes = get_student_classes(student_id)
+    return classes[0] if classes else None
+
 
 def get_pending_invitation(student_id: int) -> dict | None:
-    with get_connection() as conn:
-        row = conn.execute("""
-            SELECT c.id, c.name, cm.id AS member_id
-            FROM classes c
-            JOIN class_members cm ON c.id = cm.class_id
-            WHERE cm.student_id = ? AND cm.status = 'pending'
-            ORDER BY cm.id DESC LIMIT 1
-        """, (student_id,)).fetchone()
-    return dict(row) if row else None
+    invitations = get_pending_invitations(student_id)
+    return invitations[0] if invitations else None
 
 # ---------- Вопросы и тесты ----------
 def get_topics() -> list[str]:
@@ -570,10 +607,67 @@ def get_result(test_id: int, student_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_student_points(student_id: int) -> int:
+def get_student_points(student_id: int, class_id: int | None = None) -> int:
+    """Баллы выбранного класса; без class_id — прежняя служебная общая сумма."""
     with get_connection() as conn:
-        row = conn.execute("SELECT points FROM users WHERE id = ?", (student_id,)).fetchone()
+        if class_id is None:
+            row = conn.execute("SELECT points FROM users WHERE id = ?", (student_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT points FROM class_members WHERE student_id = ? AND class_id = ?",
+                               (student_id, class_id)).fetchone()
     return int(row["points"]) if row else 0
+
+
+def initialize_test_point_scope(conn, test: dict, student_id: int, *, legacy: bool = False) -> list[int]:
+    """Фиксируем классы один раз; позднее вступление не переносит в них старые баллы."""
+    inserted = conn.execute("INSERT OR IGNORE INTO test_point_scopes (test_id, student_id) VALUES (?, ?)",
+                            (test["id"], student_id)).rowcount
+    if inserted:
+        # У старого теста одного класса сохраняем точное назначение, в том числе
+        # если прежний участник сейчас не имеет статуса accepted.
+        rows = conn.execute("""
+            SELECT c.id FROM classes c JOIN class_members cm ON cm.class_id = c.id
+            WHERE cm.student_id = ? AND c.teacher_id = ? AND (? IS NULL OR c.id = ?)
+              AND (cm.status = 'accepted' OR (? = 1 AND ? IS NOT NULL))
+        """, (student_id, test["teacher_id"], test["class_id"], test["class_id"], int(legacy), test["class_id"])).fetchall()
+        conn.executemany("INSERT INTO test_student_classes (test_id, student_id, class_id) VALUES (?, ?, ?)",
+                         [(test["id"], student_id, row["id"]) for row in rows])
+    return [row["class_id"] for row in conn.execute(
+        "SELECT class_id FROM test_student_classes WHERE test_id = ? AND student_id = ? ORDER BY class_id",
+        (test["id"], student_id)
+    )]
+
+
+def add_class_points(conn, test: dict, student_id: int, points: int):
+    if not points:
+        return
+    conn.execute("""
+        UPDATE class_members SET points = points + ?
+        WHERE student_id = ? AND class_id IN (
+            SELECT scope.class_id FROM test_student_classes scope
+            JOIN classes c ON c.id = scope.class_id
+            WHERE scope.test_id = ? AND scope.student_id = ? AND c.teacher_id = ?
+              AND (? IS NULL OR c.id = ?)
+        )
+    """, (points, student_id, test["id"], student_id, test["teacher_id"], test["class_id"], test["class_id"]))
+
+
+def migrate_class_points(conn):
+    # Источником служат принятые ответы с сохранённым весом, а не общий users.points
+    # и не число верных ответов в test_results. Маркер защищает и пустой набор классов.
+    pending = conn.execute("""
+        SELECT answers.test_id, answers.student_id, SUM(answers.points) AS points
+        FROM student_answers answers LEFT JOIN test_point_scopes scope
+          ON scope.test_id = answers.test_id AND scope.student_id = answers.student_id
+        WHERE scope.test_id IS NULL GROUP BY answers.test_id, answers.student_id
+    """).fetchall()
+    for row in pending:
+        test = conn.execute("SELECT * FROM tests WHERE id = ?", (row["test_id"],)).fetchone()
+        if not test:
+            continue
+        test = dict(test)
+        initialize_test_point_scope(conn, test, row["student_id"], legacy=True)
+        add_class_points(conn, test, row["student_id"], int(row["points"] or 0))
 
 
 def get_student_test_answers(test_id: int, student_id: int) -> dict[int, dict]:
@@ -620,11 +714,14 @@ def record_student_answer(test_id: int, student_id: int, question_id: int, answe
         difficulty = parse_excel_difficulty(question["difficulty"])
         is_correct = int(answer == question["correct_answer"].strip().upper())
         points = difficulty if is_correct else 0
+        initialize_test_point_scope(conn, dict(test), student_id)
         cur = conn.execute("""
             INSERT INTO student_answers (test_id, student_id, question_id, answer, is_correct, points)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (test_id, student_id, question_id, answer, is_correct, points))
         if points:
+            add_class_points(conn, dict(test), student_id, points)
+            # Общую колонку сохраняем для совместимости; в интерфейсе — только баллы классов.
             conn.execute("UPDATE users SET points = points + ? WHERE id = ?", (points, student_id))
         saved = conn.execute("SELECT * FROM student_answers WHERE id = ?", (cur.lastrowid,)).fetchone()
     return {**dict(saved), "newly_recorded": True}
@@ -687,8 +784,10 @@ def get_class_test_report(teacher_id: int, class_id: int, test_id: int) -> dict 
         return None
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT u.id, u.full_name, r.id AS result_id, r.score, r.total, r.finished_at
+            SELECT u.id, u.full_name, r.id AS result_id, r.score, r.total, r.finished_at,
+                   COALESCE(class_balance.points, 0) AS class_points
             FROM users u
+            LEFT JOIN class_members class_balance ON class_balance.student_id = u.id AND class_balance.class_id = ?
             LEFT JOIN test_results r ON r.student_id = u.id AND r.test_id = ?
                 AND r.finished_at IS NOT NULL AND r.score IS NOT NULL AND r.total > 0
             WHERE EXISTS (
@@ -696,7 +795,7 @@ def get_class_test_report(teacher_id: int, class_id: int, test_id: int) -> dict 
                 WHERE cm.student_id = u.id AND cm.class_id = ? AND cm.status = 'accepted'
             ) OR (? = 1 AND r.id IS NOT NULL)
             ORDER BY u.full_name COLLATE NOCASE, u.id
-        """, (test_id, class_id, int(test["class_id"] == class_id))).fetchall()
+        """, (class_id, test_id, class_id, int(test["class_id"] == class_id))).fetchall()
         # Общую статистику считаем без соединения с class_members:
         # ученик в нескольких классах учитывается здесь только один раз.
         all_results = conn.execute("""
@@ -745,11 +844,35 @@ def get_test_lock(user_id: str) -> asyncio.Lock:
     return test_locks[user_id]
 
 # ======================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
-def build_profile_text(user: dict) -> str:
-    text = f"👤 Профиль:\nФИО: {user['full_name']}\nРоль: {user['role']}"
+def format_student_class_lines(classes: list[dict], start: int = 0) -> list[str]:
+    return [
+        f"{number}. Класс «{short_report_text(cls['name'], 80)}»\n"
+        f"Учитель: {short_report_text(cls['teacher_name'], 120)}\nБаллы: {cls['points']}"
+        for number, cls in enumerate(classes, start + 1)
+    ]
+
+
+def build_profile_view(user: dict, page: int = 0) -> tuple[str, InlineKeyboardBuilder]:
+    text = f"👤 Профиль:\nФИО: {short_report_text(user['full_name'], 180)}\nРоль: {user['role']}"
+    builder = build_main_menu(user["role"])
     if user["role"] == "student":
-        text += f"\nБаллы: {get_student_points(user['id'])}"
-    return text
+        classes = get_student_classes(user["id"])
+        items, page, pages, start = get_report_page(classes, page)
+        text += f"\n\n📚 Мои классы: {len(classes)}."
+        if items:
+            text += "\n\n" + "\n\n".join(format_student_class_lines(items, start))
+            text += f"\n\nСтраница {page + 1}/{pages}. Баллы учитываются отдельно в каждом классе."
+            add_report_pagination(builder, page, pages, "profile_page")
+        else:
+            text += "\nВы пока не вступили ни в один класс."
+        pending = len(get_pending_invitations(user["id"]))
+        if pending:
+            text += f"\n\n📩 Ожидают ответа приглашения: {pending}. Откройте «Мои классы»."
+    return text, builder
+
+
+def build_profile_text(user: dict, page: int = 0) -> str:
+    return build_profile_view(user, page)[0]
 
 
 def build_main_menu(role: str) -> InlineKeyboardBuilder:
@@ -765,7 +888,7 @@ def build_main_menu(role: str) -> InlineKeyboardBuilder:
         )
         builder.row(CallbackButton(text="Создать тест", payload="menu_create_test"))
     else:
-        builder.row(CallbackButton(text="Мой класс", payload="menu_my_class"))
+        builder.row(CallbackButton(text="Мои классы", payload="menu_my_class"))
         builder.row(CallbackButton(text="Мои тесты", payload="menu_my_tests"))
     builder.row(CallbackButton(text="Выйти", payload="logout"))
     return builder
@@ -807,18 +930,46 @@ def build_invite_class_selection(teacher_id: int) -> tuple[str, InlineKeyboardBu
     builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
     return "Выберите класс, в который хотите пригласить ученика:", builder
 
-def build_student_class_message(student_id: int) -> tuple[str, InlineKeyboardBuilder]:
-    cls = get_student_class(student_id)
-    text = f"📚 Вы в классе «{cls['name']}»." if cls else "Вы пока не вступили ни в один класс."
-    pending = get_pending_invitation(student_id)
-    if pending:
-        # Показываем сохранённое приглашение, даже если личное сообщение не дошло
-        # или ученик уже состоит в другом классе.
-        text += f"\n\n📩 Вас приглашают в класс «{pending['name']}». Принять приглашение?"
-        builder = build_invitation_keyboard(pending["id"])
-        builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
+def build_student_class_message(student_id: int, class_page: int = 0,
+                                invitation_page: int = 0) -> tuple[str, InlineKeyboardBuilder]:
+    classes = get_student_classes(student_id)
+    pending = get_pending_invitations(student_id)
+    items, class_page, class_pages, start = get_report_page(classes, class_page, page_size=STUDENT_CLASSES_PAGE_SIZE)
+    invites, invitation_page, invite_pages, invite_start = get_report_page(pending, invitation_page, page_size=STUDENT_CLASSES_PAGE_SIZE)
+    text = f"📚 Мои классы: {len(classes)}."
+    if items:
+        text += "\n\n" + "\n\n".join(format_student_class_lines(items, start))
+        text += f"\nСтраница классов {class_page + 1}/{class_pages}."
     else:
-        builder = build_error_keyboard()
+        text += "\nВы пока не вступили ни в один класс."
+    builder = InlineKeyboardBuilder()
+    if invites:
+        text += f"\n\n📩 Приглашения: {len(pending)}. Выберите действие для каждого приглашения."
+        for number, invitation in enumerate(invites, invite_start + 1):
+            text += (f"\n\n{number}. Класс «{short_report_text(invitation['name'], 80)}»\n"
+                     f"Учитель: {short_report_text(invitation['teacher_name'], 120)}")
+            builder.row(
+                CallbackButton(text=f"Принять №{number}", payload=f"accept_{invitation['id']}"),
+                CallbackButton(text=f"Отклонить №{number}", payload=f"decline_{invitation['id']}")
+            )
+        text += f"\nСтраница приглашений {invitation_page + 1}/{invite_pages}."
+    else:
+        text += "\n\nНовых приглашений нет."
+    class_buttons, invitation_buttons = [], []
+    if class_page > 0:
+        class_buttons.append(CallbackButton(text="← Классы", payload=f"student_classes_{class_page - 1}_{invitation_page}"))
+    if class_page + 1 < class_pages:
+        class_buttons.append(CallbackButton(text="Классы →", payload=f"student_classes_{class_page + 1}_{invitation_page}"))
+    if invitation_page > 0:
+        invitation_buttons.append(CallbackButton(text="← Приглашения", payload=f"student_classes_{class_page}_{invitation_page - 1}"))
+    if invitation_page + 1 < invite_pages:
+        invitation_buttons.append(CallbackButton(text="Приглашения →", payload=f"student_classes_{class_page}_{invitation_page + 1}"))
+    if class_buttons:
+        builder.row(*class_buttons)
+    if invitation_buttons:
+        builder.row(*invitation_buttons)
+    builder.row(CallbackButton(text="Обновить", payload=f"student_classes_{class_page}_{invitation_page}"))
+    builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
     return text, builder
 
 async def send_start_message(event_or_message, user_id: str):
@@ -848,7 +999,7 @@ async def set_bot_commands():
         BotCommand(name="profile", description="Мой профиль и меню"),
         BotCommand(name="create_class", description="Создать класс (учитель)"),
         BotCommand(name="invite", description="Пригласить ученика (учитель)"),
-        BotCommand(name="my_class", description="Мой класс (ученик)"),
+        BotCommand(name="my_class", description="Мои классы и приглашения (ученик)"),
         BotCommand(name="tests", description="Тесты и результаты"),
     ]
     await SetCommands(bot=bot, commands=commands).fetch()
@@ -907,9 +1058,9 @@ async def logout_no(event: MessageCallback):
     user_id = str(event.from_user.user_id)
     user = auth_cache.get(user_id)
     if user:
-        builder = build_main_menu(user["role"])
+        text, builder = build_profile_view(user)
         await event.edit(
-            text=build_profile_text(user),
+            text=text,
             attachments=[builder.as_markup()]
         )
     else:
@@ -1030,15 +1181,13 @@ async def respond_to_invitation(event: MessageCallback, status: str):
     if not cls or not set_invitation_status(class_id, user["id"], status):
         await event.answer(notification="Приглашение не найдено или уже обработано. Откройте /my_class.")
         return
-    builder = InlineKeyboardBuilder()
-    builder.row(CallbackButton(text="Мой класс", payload="menu_my_class"))
-    builder.row(CallbackButton(text="В профиль", payload="back_to_profile"))
+    classes_text, builder = build_student_class_message(user["id"])
     text = (
-        f"✅ Вы приняли приглашение в класс «{cls['name']}»!"
+        f"✅ Вы приняли приглашение в класс «{short_report_text(cls['name'], 80)}»!"
         if status == "accepted"
-        else f"Вы отклонили приглашение в класс «{cls['name']}»."
+        else f"Вы отклонили приглашение в класс «{short_report_text(cls['name'], 80)}»."
     )
-    await event.edit(text=text, attachments=[builder.as_markup()])
+    await event.edit(text=text + "\n\n" + classes_text, attachments=[builder.as_markup()])
 
 @dp.message_callback(F.callback.payload.startswith("accept_"))
 async def accept_invite(event: MessageCallback):
@@ -1113,6 +1262,21 @@ async def menu_my_class(event: MessageCallback):
     text, builder = build_student_class_message(user["id"])
     await event.edit(text=text, attachments=[builder.as_markup()])
 
+
+@dp.message_callback(F.callback.payload.startswith("student_classes_"))
+async def student_classes_page(event: MessageCallback):
+    user = auth_cache.get(str(event.from_user.user_id))
+    if not user or user["role"] != "student":
+        await event.answer(notification="Войдите как ученик через /start, затем откройте /my_class.")
+        return
+    match = re.fullmatch(r"student_classes_([0-9]{1,9})_([0-9]{1,9})", event.callback.payload)
+    if not match:
+        await event.answer(notification="Некорректная страница. Откройте /my_class.")
+        return
+    text, builder = build_student_class_message(user["id"], int(match[1]), int(match[2]))
+    await event.edit(text=text, attachments=[builder.as_markup()])
+
+
 # ======================= МОИ КЛАССЫ =======================
 @dp.message_callback(F.callback.payload == "menu_my_classes")
 async def menu_my_classes(event: MessageCallback):
@@ -1157,7 +1321,7 @@ async def view_class(event: MessageCallback):
         lines = [f"{'Фамилия Имя':<{width}} | Баллы"]
         lines.extend(f"{name:<{width}} | {student['points']}" for name, student in zip(names, items))
         text += "<pre>" + escape("\n".join(lines)) + "</pre>"
-        text += "\n\nБаллы накоплены за все тесты ученика."
+        text += "\n\nБаллы за тесты этого учителя, назначенные этому классу."
     else:
         text += "Учеников пока нет."
     text += f"\nСтраница {page + 1}/{pages}."
@@ -1174,9 +1338,9 @@ async def back_to_profile(event: MessageCallback):
     user_states.pop(user_id, None)
     user = auth_cache.get(user_id)
     if user:
-        builder = build_main_menu(user["role"])
+        text, builder = build_profile_view(user)
         await event.edit(
-            text=build_profile_text(user),
+            text=text,
             attachments=[builder.as_markup()]
         )
     else:
@@ -1193,13 +1357,28 @@ async def cmd_profile(event: MessageCreated):
     user_id = str(event.from_user.user_id)
     cached_user = auth_cache.get(user_id)
     if cached_user:
-        builder = build_main_menu(cached_user["role"])
+        text, builder = build_profile_view(cached_user)
         await event.message.answer(
-            build_profile_text(cached_user),
+            text,
             attachments=[builder.as_markup()]
         )
     else:
         await event.message.answer("Сначала войдите: /start → Войти.", attachments=[build_error_keyboard().as_markup()])
+
+
+@dp.message_callback(F.callback.payload.startswith("profile_page_"))
+async def profile_page(event: MessageCallback):
+    user = auth_cache.get(str(event.from_user.user_id))
+    if not user:
+        await event.answer(notification="Сначала войдите через /start.")
+        return
+    match = re.fullmatch(r"profile_page_([0-9]{1,9})", event.callback.payload)
+    if not match:
+        await event.answer(notification="Некорректная страница. Откройте /profile.")
+        return
+    text, builder = build_profile_view(user, int(match[1]))
+    await event.edit(text=text, attachments=[builder.as_markup()])
+
 
 # ======================= МЕНЮ ТЕСТОВ И РЕЗУЛЬТАТЫ (УЧИТЕЛЬ) =======================
 def short_report_text(value, limit: int) -> str:
@@ -1224,11 +1403,11 @@ def format_average_stats(stats: dict) -> str:
     return text
 
 
-def get_report_page(items: list, page: int) -> tuple[list, int, int, int]:
-    total_pages = max(1, (len(items) + RESULTS_PAGE_SIZE - 1) // RESULTS_PAGE_SIZE)
+def get_report_page(items: list, page: int, *, page_size: int = RESULTS_PAGE_SIZE) -> tuple[list, int, int, int]:
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
     page = min(max(page, 0), total_pages - 1)
-    start = page * RESULTS_PAGE_SIZE
-    return items[start:start + RESULTS_PAGE_SIZE], page, total_pages, start
+    start = page * page_size
+    return items[start:start + page_size], page, total_pages, start
 
 
 def add_report_pagination(builder: InlineKeyboardBuilder, page: int, total_pages: int, prefix: str):
@@ -1390,7 +1569,7 @@ async def view_test_results(event: MessageCallback):
             f"{student['score']} из {student['total']} правильных"
             if student["result_id"] is not None else "не пройден"
         )
-        lines.append(f"{number}. {name} — {result}.")
+        lines.append(f"{number}. {name} — {result}. Баллы в классе: {student['class_points']}.")
     if not students:
         lines.append("В этом классе пока нет учеников.")
     if test["class_id"] is None:
@@ -2232,7 +2411,7 @@ async def finish_student_test(max_user_id, user_id: str, *, expired: bool = Fals
     active_tests.pop(user_id, None)
     title = "⏰ Время на тест истекло." if expired else "🏁 Тест завершён!"
     text = f"{title}\nВаш результат: {result['score']}/{result['total']} правильных ответов."
-    text += f"\nБаллы за тест: {state['earned_points']}.\nВсего баллов: {get_student_points(state['student_id'])}."
+    text += f"\nБаллы за тест: {state['earned_points']}.\nБаллы по каждому классу доступны в профиле."
     return await deliver_test_message(max_user_id, text, [build_main_menu("student").as_markup()])
 
 
@@ -2402,20 +2581,13 @@ async def handle_text(event: MessageCreated):
                 active = active_tests.get(user_id)
                 if active and active["student_id"] != user["id"]:
                     active_tests.pop(user_id, None)
-                builder = build_main_menu(user["role"])
-                welcome_text = f"✅ Добро пожаловать, {user['full_name']}!\nВаша роль: {user['role']}"
+                profile_text, builder = build_profile_view(user)
+                welcome_text = f"✅ Добро пожаловать!\n\n{profile_text}"
                 if user["role"] == "student":
-                    welcome_text += f"\nБаллы: {get_student_points(user['id'])}"
                     resume_test_id = state.get("resume_test_id")
                     if resume_test_id is not None:
                         builder.row(CallbackButton(text="Пройти тест", payload=f"start_test_{resume_test_id}"))
                         welcome_text += "\n\nНажмите «Пройти тест», чтобы вернуться к выбранному заданию."
-                    pending = get_pending_invitation(user["id"])
-                    if pending:
-                        welcome_text += (
-                            f"\n\n📩 У вас есть приглашение в класс «{pending['name']}»."
-                            "\nНажмите «Мой класс», чтобы принять или отклонить его."
-                        )
                 await event.message.answer(
                     welcome_text,
                     attachments=[builder.as_markup()]
@@ -2498,14 +2670,14 @@ async def handle_text(event: MessageCreated):
                     logging.exception("Не удалось отправить приглашение в класс %s ученику %s", cls["id"], student["id"])
                     result_text = (
                         "⚠️ Приглашение сохранено, но не удалось отправить сообщение ученику."
-                        "\nУченик сможет принять его после входа через «Мой класс» или /my_class."
+                        "\nУченик сможет принять его после входа через «Мои классы» или /my_class."
                     )
                 else:
                     result_text = f"✅ Приглашение отправлено ученику {student['full_name']} в класс «{cls['name']}»."
             else:
                 result_text = (
                     f"⚠️ Приглашение для {student['full_name']} сохранено, но его MAX-аккаунт ещё не привязан."
-                    "\nПопросите ученика войти в бота через /start и открыть «Мой класс» или /my_class."
+                    "\nПопросите ученика войти в бота через /start и открыть «Мои классы» или /my_class."
                 )
             user_states.pop(user_id, None)
             await event.message.answer(result_text, attachments=[build_error_keyboard().as_markup()])
