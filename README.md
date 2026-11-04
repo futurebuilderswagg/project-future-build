@@ -254,7 +254,7 @@
 ```bash
 python -m venv .venv
 source .venv/Scripts/activate
-python pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 Для новой установки, если `token.env` ещё нет:
