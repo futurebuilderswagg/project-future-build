@@ -252,10 +252,9 @@
 ### Linux и macOS
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m venv .venv
+source .venv/Scripts/activate
+python pip install -r requirements.txt
 ```
 
 Для новой установки, если `token.env` ещё нет:
