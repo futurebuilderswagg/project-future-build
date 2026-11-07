@@ -1,0 +1,15 @@
+# Токены и настройки
+token.env
+.env
+
+# Данные учеников
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Окружение Python
+.venv/
+venv/
+__pycache__/
+*.pyc

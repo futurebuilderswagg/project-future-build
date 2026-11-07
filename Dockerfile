@@ -14,7 +14,10 @@ RUN groupadd --gid 10001 app \
     && chown app:app /app/data
 
 # Токен и база подключаются при запуске контейнера.
-COPY main.py /app/main.py
+COPY main.py test_template.xlsx /app/
+COPY impulse /app/impulse
+COPY catalog /app/catalog
+COPY assets /app/assets
 
 USER app:app
 WORKDIR /app/data

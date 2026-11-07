@@ -3,3 +3,10 @@
 !.dockerignore
 !requirements.txt
 !main.py
+!test_template.xlsx
+!impulse
+!impulse/**
+!catalog
+!catalog/**
+!assets
+!assets/**
